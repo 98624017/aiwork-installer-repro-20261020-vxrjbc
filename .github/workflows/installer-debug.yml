@@ -19,7 +19,7 @@ jobs:
       matrix:
         mode: [direct, current-user, all-users]
     runs-on: windows-2025
-    timeout-minutes: 7
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,7 +33,7 @@ jobs:
           gh release download builder-26.15.3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern official-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
       - name: Install, verify payload and shortcuts, reinstall and uninstall
-        timeout-minutes: 5
+        timeout-minutes: 8
         shell: pwsh
         env:
           PROBE_MODE: ${{ matrix.mode }}

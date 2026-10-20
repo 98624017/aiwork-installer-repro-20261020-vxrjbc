@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+. (Join-Path $PSScriptRoot 'shortcut-probe.ps1')
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $StartedAt = [DateTime]::UtcNow
 $Cases = New-Object System.Collections.ArrayList
@@ -392,7 +393,6 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
 
 function Get-InstalledShortcutSnapshot([object[]]$Folders, [string]$Name, [string]$AppId, [object]$Package) {
     $defaultName = [regex]::Unescape('AI \u521b\u4f5c\u5de5\u4f5c\u53f0.lnk')
-    $wscript = New-Object -ComObject WScript.Shell
     $shell = New-Object -ComObject Shell.Application
     $snapshot = [ordered]@{ setupSha256 = $Package.sha256; expectedFilename = $Name + '.lnk'; expectedAppUserModelId = $AppId; shortcutNameUtf16ByteLength = (Get-Item -LiteralPath (Join-Path $InstallDirectory 'channel-shortcut-name.txt')).Length; folders = @(); links = @(); unreadableLinkCount = 0 }
     $script:LastShortcutEvidence = $snapshot
@@ -403,7 +403,7 @@ function Get-InstalledShortcutSnapshot([object[]]$Folders, [string]$Name, [strin
         $snapshot.folders += [ordered]@{ context = $folder.kind; exists = $exists; enumeratedLinkCount = $entries.Count }
         foreach ($entry in $entries) {
             $knownName = $entry.Name -eq ($Name + '.lnk') -or $entry.Name -eq $defaultName
-            try { $link = $wscript.CreateShortcut($entry.FullName); $target = [string]$link.TargetPath }
+            try { $link = [ShortcutProbe]::Read($entry.FullName); $target = [string]$link.TargetPath }
             catch {
                 $snapshot.unreadableLinkCount++
                 if ($knownName) { $snapshot.links += [ordered]@{ context = $folder.kind; filename = $entry.Name; readable = $false; readErrorType = $_.Exception.GetType().Name } }
@@ -760,23 +760,8 @@ public static class ValidationFixture {
         $roundTripExe = Join-Path $roundTripDirectory 'ai-canvas.exe'
         $roundTripLink = Join-Path $roundTripDirectory 'reader-selftest.lnk'
         Copy-Item -LiteralPath $FixtureExecutable -Destination $roundTripExe
-        $writerShell = New-Object -ComObject WScript.Shell
-        $testLink = $writerShell.CreateShortcut($roundTripLink)
-        try { $testLink.TargetPath = $roundTripExe }
-        catch {
-            $Report.shortcutReaderSelfTestFailure = [ordered]@{
-                stage = 'set-target-path'; exceptionType = $_.Exception.GetType().FullName
-                hresult = $_.Exception.HResult; syntheticTarget = $roundTripExe
-                targetType = $roundTripExe.GetType().FullName; targetExists = (Test-Path -LiteralPath $roundTripExe)
-                targetLength = $roundTripExe.Length; message = $_.Exception.Message
-            }
-            throw
-        }
-        $testLink.WorkingDirectory = $roundTripDirectory
-        $testLink.IconLocation = $roundTripExe + ',0'
-        $testLink.Save()
-        $readerShell = New-Object -ComObject WScript.Shell
-        $observedLink = $readerShell.CreateShortcut($roundTripLink)
+        [ShortcutProbe]::WriteFixture($roundTripLink, $roundTripExe, $roundTripDirectory)
+        $observedLink = [ShortcutProbe]::Read($roundTripLink)
         Assert-True ([string]::Equals([string]$observedLink.TargetPath, $roundTripExe, [StringComparison]::OrdinalIgnoreCase)) 'shortcut-reader-target-roundtrip-failed'
         Assert-True ([string]::Equals([string]$observedLink.WorkingDirectory, $roundTripDirectory, [StringComparison]::OrdinalIgnoreCase)) 'shortcut-reader-workingdir-roundtrip-failed'
         Assert-True ([string]::Equals(([string]$observedLink.IconLocation -replace ',\s*-?\d+$', '').Trim('"'), $roundTripExe, [StringComparison]::OrdinalIgnoreCase)) 'shortcut-reader-icon-roundtrip-failed'

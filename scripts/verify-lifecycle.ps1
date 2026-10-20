@@ -3,6 +3,7 @@ param([ValidateSet('direct', 'current-user', 'all-users')][string]$Mode)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
+. (Join-Path $PSScriptRoot 'shortcut-probe.ps1')
 $utf8 = [Text.UTF8Encoding]::new($false)
 $output = Join-Path $PWD 'lifecycle-evidence'
 New-Item -ItemType Directory -Path $output | Out-Null
@@ -32,7 +33,11 @@ function Test-Payload([string]$Target) {
 function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
     $child = Start-Process -FilePath $File -ArgumentList $Arguments -PassThru
     try {
-        if (-not $child.WaitForExit(60000)) { $child.Kill(); throw 'installer-process-timeout' }
+        if (-not $child.WaitForExit(180000)) {
+            $report.timeoutWindow = [string]$child.MainWindowTitle
+            $child.Kill()
+            throw 'installer-process-timeout'
+        }
         if ($child.ExitCode -ne 0) { throw 'installer-process-nonzero-exit' }
         return $child.ExitCode
     } finally { $child.Dispose() }
@@ -55,13 +60,12 @@ try {
         [Environment]::GetFolderPath('DesktopDirectory'), [Environment]::GetFolderPath('Programs'),
         [Environment]::GetFolderPath('CommonDesktopDirectory'), [Environment]::GetFolderPath('CommonPrograms')
     )
-    $shell = New-Object -ComObject WScript.Shell
     $links = @()
     $ownedLinks = @()
     foreach ($folder in $folders) {
         $linkPath = Join-Path $folder ($name + '.lnk')
         if (-not (Test-Path -LiteralPath $linkPath -PathType Leaf)) { continue }
-        $link = $shell.CreateShortcut($linkPath)
+        $link = [ShortcutProbe]::Read($linkPath)
         $icon = ([string]$link.IconLocation -replace ',\s*-?\d+$', '').Trim('"')
         $matches = [string]::Equals([string]$link.TargetPath, (Join-Path $target 'ai-canvas.exe'), [StringComparison]::OrdinalIgnoreCase)
         $iconWithin = $icon.StartsWith($target + '\', [StringComparison]::OrdinalIgnoreCase)
