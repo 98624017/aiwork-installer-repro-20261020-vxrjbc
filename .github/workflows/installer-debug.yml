@@ -6,12 +6,47 @@ on:
       suite:
         type: choice
         default: branding
-        options: [branding, lifecycle, full, all, uninstall-diagnostic]
+        options: [branding, channel-switch, lifecycle, full, all, uninstall-diagnostic]
 
 permissions:
   contents: read
 
 jobs:
+  channel-switch:
+    if: inputs.suite == 'channel-switch' || inputs.suite == 'all'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Fetch hash-pinned protected installers
+        timeout-minutes: 2
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download branding-fixed-r2 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
+          gh release download candidate --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern baseline-setup.exe --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'baseline-download-failed' }
+      - name: Change channel through the installed package under PowerShell 5.1
+        shell: powershell
+        run: |
+          & ./scripts/verify-windows-installer.ps1 -ManifestPath ./branding-candidate.json -PayloadDirectory ./payload -OutputDirectory ./channel-switch-evidence -BrandingOnly -FreshCandidate -ChannelSwitch
+      - name: Upload sanitized channel switch evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: channel-switch-${{ matrix.os }}
+          path: channel-switch-evidence/
+          retention-days: 7
+          if-no-files-found: error
+
   uninstall-diagnostic:
     if: inputs.suite == 'uninstall-diagnostic'
     runs-on: windows-2025

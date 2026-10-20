@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$PayloadDirectory,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [switch]$BrandingOnly,
-    [switch]$FreshCandidate
+    [switch]$FreshCandidate,
+    [switch]$ChannelSwitch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,10 +28,13 @@ $Baseline = $null
 $ExpectedInstalled = $null
 $PackagedHelpers = @{}
 $OriginalAppId = $null
+$SwitchChannel = $null
+$SwitchPreviousShortcutName = ''
 $FixtureProcess = $null
 $OtherProcess = $null
 $BackupExecutable = Join-Path $TestRoot 'protected-app-backup.exe'
 $ExpectedCaseCount = if ($BrandingOnly) { if ($FreshCandidate) { 4 } else { 5 } } else { 18 }
+if ($ChannelSwitch) { $ExpectedCaseCount += 3 }
 $GracefulFixtureDelayMilliseconds = 6000
 $Report = [ordered]@{
     schemaVersion = 1
@@ -44,7 +48,7 @@ $Report = [ordered]@{
     host64Bit = [Environment]::Is64BitProcess
     os64Bit = [Environment]::Is64BitOperatingSystem
     channelCode = 'XINBAO-AI'
-    suite = if ($BrandingOnly) { 'branding' } else { 'full' }
+    suite = if ($ChannelSwitch) { 'branding-channel-switch' } elseif ($BrandingOnly) { 'branding' } else { 'full' }
     installation = if ($FreshCandidate) { 'fresh-candidate' } else { 'baseline-upgrade' }
     cases = $Cases
     limitations = @(
@@ -267,8 +271,9 @@ function Add-InstallerTrace([Collections.ArrayList]$Trace, [Diagnostics.Stopwatc
     $script:LastInstallerTrace = @($Trace)
 }
 
-function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
+function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [string]$ChannelCode = 'XINBAO-AI', [string]$ExpectedPrefilledCode = '') {
     Assert-True (([DateTime]::UtcNow - $StartedAt).TotalMinutes -lt 25) 'overall-harness-time-budget-exhausted'
+    Assert-True ($ChannelCode -ceq 'XINBAO-AI' -or ($ChannelSwitch -and $ChannelCode -ceq 'HUIDA-AI')) 'only-authorized-channel-supported'
     $arguments = '/currentuser '
     if ($Mode -eq 'updated') { $arguments += '--updated --force-run ' }
     if ($Mode -eq 'silent') { $arguments += '/S ' }
@@ -283,6 +288,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $lastStage = ''
     $channelInputHandle = [IntPtr]::Zero
+    $prefilledChannelConfirmed = $false
     $emptySince = $null
     $lastUi = @()
     $lastHandle = [IntPtr]::Zero
@@ -311,8 +317,13 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
         if ($stage -eq 'channel-input') {
             $field = @($lastUi | Where-Object { $_.Id -eq 1201 -and $_.ClassName -eq 'Edit' })[0]
             if ($field.Handle -ne $channelInputHandle) {
-                $set = [NativeInstallerProbe]::SetText($field.Handle, 'XINBAO-AI')
-                $confirmed = $set -and [NativeInstallerProbe]::TextEquals($field.Handle, 'XINBAO-AI')
+                if ($ExpectedPrefilledCode -ne '') {
+                    $prefilledChannelConfirmed = [NativeInstallerProbe]::TextEquals($field.Handle, $ExpectedPrefilledCode)
+                    Add-InstallerTrace $trace $timer $stage 'previous-channel-prefill-confirmed' 'WM_GETTEXT' $field.Id $prefilledChannelConfirmed
+                    Assert-True $prefilledChannelConfirmed 'activation-page-previous-channel-not-prefilled'
+                }
+                $set = [NativeInstallerProbe]::SetText($field.Handle, $ChannelCode)
+                $confirmed = $set -and [NativeInstallerProbe]::TextEquals($field.Handle, $ChannelCode)
                 Add-InstallerTrace $trace $timer $stage 'authorized-channel-input-confirmed' 'WM_SETTEXT' $field.Id $confirmed
                 Assert-True $confirmed 'activation-page-channel-input-failed'
                 $channelInputHandle = $field.Handle
@@ -406,6 +417,11 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
     if ($Mode -eq 'standalone' -and $Scenario -ne 'no-target') { Assert-True ($normalCount -ge 1) 'standalone-normal-prompt-missing' }
     if ($Mode -eq 'updated') { Assert-True ($normalCount -eq 0) 'updated-initial-prompt-not-skipped' }
     $result = [ordered]@{ mode = $Mode; scenario = $Scenario; actions = @($actions); exitCode = $process.ExitCode; elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2) }
+    if ($ExpectedPrefilledCode -ne '') {
+        Assert-True ($channelInputHandle -ne [IntPtr]::Zero -and $prefilledChannelConfirmed) 'channel-switch-editable-page-not-observed'
+        $result.channelCode = $ChannelCode
+        $result.previousChannelPrefillConfirmed = $prefilledChannelConfirmed
+    }
     if ($Mode -eq 'updated' -and $Scenario -ne 'cancel' -and $process.ExitCode -eq 0) {
         $deadline = [DateTime]::UtcNow.AddSeconds(25)
         $mains = @()
@@ -422,7 +438,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
     return $result
 }
 
-function Get-InstalledShortcutSnapshot([object[]]$Folders, [string]$Name, [string]$AppId, [object]$Package) {
+function Get-InstalledShortcutSnapshot([object[]]$Folders, [string]$Name, [string]$AppId, [object]$Package, [string]$PreviousName = '') {
     $defaultName = [regex]::Unescape('AI \u521b\u4f5c\u5de5\u4f5c\u53f0.lnk')
     $shell = New-Object -ComObject Shell.Application
     $snapshot = [ordered]@{ setupSha256 = $Package.sha256; expectedFilename = $Name + '.lnk'; expectedAppUserModelId = $AppId; shortcutNameUtf16ByteLength = (Get-Item -LiteralPath (Join-Path $InstallDirectory 'channel-shortcut-name.txt')).Length; folders = @(); links = @(); unreadableLinkCount = 0 }
@@ -433,7 +449,7 @@ function Get-InstalledShortcutSnapshot([object[]]$Folders, [string]$Name, [strin
         if ($exists) { $entries = @(Get-ChildItem -LiteralPath $folder.path -Filter '*.lnk' -File -Recurse) }
         $snapshot.folders += [ordered]@{ context = $folder.kind; exists = $exists; enumeratedLinkCount = $entries.Count }
         foreach ($entry in $entries) {
-            $knownName = $entry.Name -eq ($Name + '.lnk') -or $entry.Name -eq $defaultName
+            $knownName = $entry.Name -eq ($Name + '.lnk') -or $entry.Name -eq $defaultName -or ($PreviousName -ne '' -and $entry.Name -eq ($PreviousName + '.lnk'))
             try { $link = [ShortcutProbe]::Read($entry.FullName); $target = [string]$link.TargetPath }
             catch {
                 $snapshot.unreadableLinkCount++
@@ -476,13 +492,13 @@ function Get-InstalledShortcutSnapshot([object[]]$Folders, [string]$Name, [strin
     return $snapshot
 }
 
-function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictShortcuts = $true) {
+function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictShortcuts = $true, [string]$ExpectedCode = 'XINBAO-AI', [string]$ExpectedName = '', [string]$PreviousShortcutName = '', [bool]$RequireAllShortcutContexts = $false) {
     $binding = Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-binding-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$binding.channelName)) 'channel-name-empty'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$binding.bindingToken)) 'channel-token-missing'
-    if ($null -ne $manifest.PSObject.Properties['expectedChannelName']) {
-        Assert-True ([string]$binding.channelName -ceq [string]$manifest.expectedChannelName) 'channel-name-not-expected'
-    }
+    $hasExpectedName = $ExpectedName -ne '' -or $null -ne $manifest.PSObject.Properties['expectedChannelName']
+    if ($ExpectedName -eq '' -and $null -ne $manifest.PSObject.Properties['expectedChannelName']) { $ExpectedName = [string]$manifest.expectedChannelName }
+    if ($hasExpectedName) { Assert-True ([string]$binding.channelName -ceq $ExpectedName) 'channel-name-not-expected' }
     $versionInfo = (Get-Item -LiteralPath $TargetExecutable).VersionInfo
     $version = [string]$versionInfo.FileVersion
     $nativeVersion = '{0}.{1}.{2}.{3}' -f $versionInfo.ProductMajorPart, $versionInfo.ProductMinorPart, $versionInfo.ProductBuildPart, $versionInfo.ProductPrivatePart
@@ -497,7 +513,7 @@ function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictSh
     Assert-True ($version -eq $Package.version) 'installed-file-version-mismatch'
     Assert-True ($nativeVersion -eq $expectedNativeVersion) 'installed-native-product-version-mismatch'
     $code = (Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-code.txt') -Raw -Encoding UTF8).Trim()
-    Assert-True ($code -eq 'XINBAO-AI') 'channel-code-mismatch'
+    Assert-True ($code -ceq $ExpectedCode) 'channel-code-mismatch'
     $diagnostics = Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-install-diagnostics.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $mode = [string]$diagnostics.mode
     Assert-True ($mode -eq 'resolved') 'real-channel-not-resolved'
@@ -511,7 +527,7 @@ function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictSh
         @{ kind = 'desktop-all'; path = [Environment]::GetFolderPath('CommonDesktopDirectory') },
         @{ kind = 'programs-all'; path = [Environment]::GetFolderPath('CommonPrograms') }
     )
-    $shortcutEvidence = Get-InstalledShortcutSnapshot $folders $name $appId $Package
+    $shortcutEvidence = Get-InstalledShortcutSnapshot $folders $name $appId $Package $PreviousShortcutName
     $links = @($shortcutEvidence.links | Where-Object { $_.readable -and $_.rootEntry -and $_.expectedNameMatch -and $_.targetMatch })
     $gaps = @()
     foreach ($link in $links) {
@@ -528,6 +544,32 @@ function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictSh
             if (Test-Path -LiteralPath (Join-Path $folder.path $defaultName)) { $gaps += 'stale-white-label-shortcut' }
         }
     }
+    if ($RequireAllShortcutContexts) {
+        $expectedShortcutName = (($ExpectedName -replace '[\\/:*?"<>|]', ' ').Trim() -replace '\s+', ' ').Trim()
+        if ($expectedShortcutName.Length -gt 60) { $expectedShortcutName = $expectedShortcutName.Substring(0, 60).Trim() }
+        Assert-True ($name -ceq $expectedShortcutName) 'switched-shortcut-name-not-new-channel'
+        Assert-True ((Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-name.txt') -Raw -Encoding UTF8).Trim() -ceq $ExpectedName) 'switched-installed-display-name-mismatch'
+        $iconName = (Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-shortcut-icon-name.txt') -Raw -Encoding UTF8).Trim()
+        Assert-True ($iconName -ne '' -and [IO.Path]::GetFileName($iconName) -ceq $iconName -and $iconName.EndsWith('.ico', [StringComparison]::OrdinalIgnoreCase)) 'switched-icon-metadata-invalid'
+        $expectedIconRelative = 'brand\' + $iconName
+        foreach ($folder in $folders) {
+            $matchingLinks = @($links | Where-Object { $_.context -eq $folder.kind })
+            if ($matchingLinks.Count -ne 1) { $gaps += 'switched-shortcut-context-missing' }
+            if (@($matchingLinks | Where-Object { $_.iconRelative -cne $expectedIconRelative }).Count -gt 0) { $gaps += 'switched-shortcut-icon-not-current-brand' }
+        }
+        $shortcutEvidence.expectedIconRelative = $expectedIconRelative
+        $shortcutEvidence.iconSha256 = Get-Hash (Join-Path $InstallDirectory $expectedIconRelative)
+        $shortcutEvidence.expectedIconSha256 = $SwitchChannel.expectedIconSha256
+        Assert-True ($shortcutEvidence.iconSha256 -ceq $SwitchChannel.expectedIconSha256) 'switched-icon-not-expected-channel'
+        Assert-True ((Get-Hash (Join-Path $InstallDirectory 'channel.ico')) -ceq $SwitchChannel.expectedIconSha256) 'switched-loose-icon-not-expected-channel'
+    }
+    if ($PreviousShortcutName -ne '') {
+        Assert-True ($name -cne $PreviousShortcutName) 'channel-switch-shortcut-name-did-not-change'
+        $oldLinks = @($shortcutEvidence.links | Where-Object { $_.filename -eq ($PreviousShortcutName + '.lnk') })
+        if ($oldLinks.Count -gt 0) { $gaps += 'stale-previous-channel-shortcut' }
+        $shortcutEvidence.previousFilename = $PreviousShortcutName + '.lnk'
+        $shortcutEvidence.previousShortcutCount = $oldLinks.Count
+    }
     $shortcutEvidence.acceptanceRole = if ($StrictShortcuts) { 'candidate-acceptance' } else { 'historical-baseline-observation' }
     $shortcutEvidence.brandingGaps = @($gaps | Select-Object -Unique)
     $shortcutEvidence.strictBrandingSatisfied = $gaps.Count -eq 0
@@ -535,7 +577,7 @@ function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictSh
     if ($StrictShortcuts -and $gaps.Count -gt 0) { throw ('ASSERT:' + $gaps[0]) }
     Assert-True ((Get-Content -LiteralPath (Join-Path $AssetDirectory 'sentinel.txt') -Raw -Encoding UTF8) -eq 'external-asset-must-survive') 'external-assets-changed'
     $slug = if ($null -ne $binding.PSObject.Properties['channelSlug']) { [string]$binding.channelSlug } elseif ($null -ne $binding.PSObject.Properties['slug']) { [string]$binding.slug } else { '' }
-    return [ordered]@{ version = $version; productVersion = [string]$versionInfo.ProductVersion; nativeProductVersion = $nativeVersion; channelName = [string]$binding.channelName; channelSlug = $slug; mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; shortcutEvidence = $shortcutEvidence; hashes = $hashes }
+    return [ordered]@{ version = $version; productVersion = [string]$versionInfo.ProductVersion; nativeProductVersion = $nativeVersion; channelCode = $code; channelName = [string]$binding.channelName; channelSlug = $slug; mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; shortcutEvidence = $shortcutEvidence; hashes = $hashes }
 }
 
 function Assert-CandidateFiles {
@@ -639,14 +681,56 @@ function Wait-ElectronMainReady([int]$ProcessId, [int]$Seconds) {
     throw 'ASSERT:electron-main-window-readiness-timeout'
 }
 
+function Invoke-ChannelBrandingSmoke([string]$ExpectedCode, [string]$ExpectedName, [string]$PreviousShortcutName = '') {
+    Assert-True (@(Get-TargetProcesses).Count -eq 0) 'channel-branding-start-requires-complete-exit'
+    $app = Start-Process -FilePath $TargetExecutable -PassThru
+    try {
+        $readiness = Wait-ElectronMainReady $app.Id 60
+        $binding = Get-Content -LiteralPath (Join-Path $UserDataDirectory 'channel-binding.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $installedBinding = Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-binding-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-True ([string]$binding.channelName -ceq $ExpectedName) 'runtime-channel-name-mismatch'
+        Assert-True (-not [string]::IsNullOrWhiteSpace([string]$binding.bindingToken)) 'runtime-channel-token-missing'
+        Assert-True ([string]$binding.channelId -ceq [string]$installedBinding.channelId) 'runtime-channel-id-not-installed-channel'
+        $code = (Get-Content -LiteralPath (Join-Path $UserDataDirectory 'channel-code.txt') -Raw -Encoding UTF8).Trim()
+        Assert-True ($code -ceq $ExpectedCode) 'runtime-channel-code-mismatch'
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        do {
+            $windows = @([NativeInstallerProbe]::Windows([int[]]@($app.Id)))
+            $branded = @($windows | Where-Object { $_.TopLevel -and $_.Text -ceq $ExpectedName })
+            if ($branded.Count -gt 0) { break }
+            Start-Sleep -Milliseconds 200
+        } while ([DateTime]::UtcNow -lt $deadline)
+        Assert-True ($branded.Count -gt 0) 'runtime-window-channel-title-mismatch'
+        $identity = Assert-InstalledIdentity $Candidate $true $ExpectedCode $ExpectedName $PreviousShortcutName ($PreviousShortcutName -ne '')
+        return @{ readiness = $readiness; runtimeChannelCode = $code; runtimeChannelName = [string]$binding.channelName; runtimeInstallChannelIdMatch = $true; brandedNativeWindowCount = $branded.Count; installed = $identity }
+    }
+    finally {
+        Stop-TargetProcesses
+        $exitDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (@(Get-TargetProcesses).Count -gt 0 -and [DateTime]::UtcNow -lt $exitDeadline) { Start-Sleep -Milliseconds 200 }
+        Assert-True (@(Get-TargetProcesses).Count -eq 0) 'channel-branding-app-did-not-completely-exit'
+    }
+}
+
 try {
     [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
     Assert-True ($PSVersionTable.PSEdition -eq 'Desktop' -and $PSVersionTable.PSVersion.Major -eq 5 -and $PSVersionTable.PSVersion.Minor -eq 1) 'requires-windows-powershell-51'
     Assert-True ([Environment]::OSVersion.Platform -eq 'Win32NT') 'requires-native-windows'
     Assert-True ([Environment]::Is64BitProcess) 'requires-native-64-bit-powershell-host'
     Assert-True (-not $FreshCandidate -or $BrandingOnly) 'fresh-candidate-requires-branding-suite'
+    Assert-True (-not $ChannelSwitch -or $BrandingOnly) 'channel-switch-requires-branding-suite'
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ([string]$manifest.channelCode -eq 'XINBAO-AI') 'only-authorized-channel-supported'
+    if ($ChannelSwitch) {
+        Assert-True ($null -ne $manifest.PSObject.Properties['channelSwitch'] -and $null -ne $manifest.channelSwitch) 'channel-switch-manifest-missing'
+        Assert-True ($null -ne $manifest.channelSwitch.PSObject.Properties['channelCode'] -and [string]$manifest.channelSwitch.channelCode -ceq 'HUIDA-AI') 'channel-switch-code-not-authorized'
+        Assert-True ($null -ne $manifest.channelSwitch.PSObject.Properties['expectedChannelName'] -and -not [string]::IsNullOrWhiteSpace([string]$manifest.channelSwitch.expectedChannelName)) 'channel-switch-expected-name-missing'
+        Assert-True ($null -ne $manifest.channelSwitch.PSObject.Properties['expectedIconSha256'] -and [string]$manifest.channelSwitch.expectedIconSha256 -match '^[a-fA-F0-9]{64}$') 'channel-switch-expected-icon-hash-invalid'
+        Assert-True ($null -ne $manifest.PSObject.Properties['expectedChannelName'] -and -not [string]::IsNullOrWhiteSpace([string]$manifest.expectedChannelName)) 'original-channel-expected-name-missing'
+        Assert-True ([string]$manifest.channelSwitch.expectedChannelName -cne [string]$manifest.expectedChannelName) 'channel-switch-expected-name-must-change'
+        $SwitchChannel = [pscustomobject]@{ channelCode = [string]$manifest.channelSwitch.channelCode; expectedChannelName = [string]$manifest.channelSwitch.expectedChannelName; expectedIconSha256 = ([string]$manifest.channelSwitch.expectedIconSha256).ToLowerInvariant() }
+        $Report.channelSwitch = [ordered]@{ fromChannelCode = 'XINBAO-AI'; toChannelCode = $SwitchChannel.channelCode; expectedChannelName = $SwitchChannel.expectedChannelName; expectedIconSha256 = $SwitchChannel.expectedIconSha256 }
+    }
     Assert-True ($null -ne $manifest.PSObject.Properties['appGuid'] -and [string]$manifest.appGuid -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') 'manifest-invalid-app-guid'
     $Candidate = Get-Payload $manifest.candidate
     $Baseline = Get-Payload $manifest.baseline
@@ -861,23 +945,28 @@ public static class ValidationFixture {
         return @{ helperCount = $helpers.Count; nativeLFResolverExitCode = 0; nativeUnicodeShortcutRoundTrip = $true; failedRepairPreservesOldLink = $true; helpers = @($helpers | ForEach-Object { @{ filename = $_.filename; sha256 = $_.sha256; asciiSource = $_.asciiSource; lfParserErrors = $_.lfParserErrors } }) }
     } | Out-Null
     if ($BrandingOnly) {
-        Invoke-Case 'actual-protected-electron-channel-branding' {
-            $app = Start-Process -FilePath $TargetExecutable -PassThru
-            try {
-                $readiness = Wait-ElectronMainReady $app.Id 60
-                $binding = Get-Content -LiteralPath (Join-Path $UserDataDirectory 'channel-binding.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-                Assert-True ([string]$binding.channelName -ceq [string]$manifest.expectedChannelName) 'runtime-channel-name-mismatch'
-                $deadline = [DateTime]::UtcNow.AddSeconds(20)
-                do {
-                    $windows = @([NativeInstallerProbe]::Windows([int[]]@($app.Id)))
-                    $branded = @($windows | Where-Object { $_.TopLevel -and $_.Text -ceq [string]$manifest.expectedChannelName })
-                    if ($branded.Count -gt 0) { break }
-                    Start-Sleep -Milliseconds 200
-                } while ([DateTime]::UtcNow -lt $deadline)
-                Assert-True ($branded.Count -gt 0) 'runtime-window-channel-title-mismatch'
-                return @{ readiness = $readiness; runtimeChannelName = [string]$binding.channelName; brandedNativeWindowCount = $branded.Count; installed = (Assert-InstalledIdentity) }
-            } finally { Stop-TargetProcesses }
-        } | Out-Null
+        $ok = Invoke-Case 'actual-protected-electron-channel-branding' {
+            Invoke-ChannelBrandingSmoke 'XINBAO-AI' ([string]$manifest.expectedChannelName)
+        }
+        if ($ChannelSwitch) {
+            Assert-True $ok 'original-channel-runtime-prerequisite-failed'
+            $ok = Invoke-Case 'same-protected-setup-interactive-channel-switch' {
+                Assert-True (@(Get-TargetProcesses).Count -eq 0) 'channel-switch-requires-complete-exit'
+                $script:SwitchPreviousShortcutName = (Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-shortcut-name.txt') -Raw -Encoding Unicode).Trim()
+                Assert-True (-not [string]::IsNullOrWhiteSpace($SwitchPreviousShortcutName)) 'channel-switch-previous-shortcut-name-missing'
+                $flow = Invoke-Installer $Candidate 'standalone' 'no-target' $SwitchChannel.channelCode 'XINBAO-AI'
+                $identity = Assert-InstalledIdentity $Candidate $true $SwitchChannel.channelCode $SwitchChannel.expectedChannelName $SwitchPreviousShortcutName $true
+                return @{ flow = $flow; fromChannelCode = 'XINBAO-AI'; toChannelCode = $SwitchChannel.channelCode; originalAppUserModelIdPreserved = $true; installed = $identity }
+            }
+            Assert-True $ok 'channel-switch-install-prerequisite-failed'
+            $ok = Invoke-Case 'actual-protected-electron-switched-channel-first-launch' {
+                Invoke-ChannelBrandingSmoke $SwitchChannel.channelCode $SwitchChannel.expectedChannelName $SwitchPreviousShortcutName
+            }
+            Assert-True $ok 'channel-switch-first-launch-prerequisite-failed'
+            Invoke-Case 'actual-protected-electron-switched-channel-restart-no-rollback' {
+                Invoke-ChannelBrandingSmoke $SwitchChannel.channelCode $SwitchChannel.expectedChannelName $SwitchPreviousShortcutName
+            } | Out-Null
+        }
     } else {
     $ok = Invoke-Case 'installed-powershell-51-lf-only-helper' {
         $helper = Join-Path $InstallDirectory 'installer-manage-process.ps1'
@@ -1033,6 +1122,7 @@ finally {
     $lines = @('Status: ' + $Report.status)
     $lines += 'PowerShell: ' + $Report.powershellVersion
     $lines += 'Channel: XINBAO-AI'
+    if ($ChannelSwitch -and $null -ne $SwitchChannel) { $lines += 'Channel switch: XINBAO-AI -> ' + $SwitchChannel.channelCode }
     $lines += @($Cases | ForEach-Object { $_.status.ToUpperInvariant() + ' ' + $_.name + ' (' + $_.elapsedSeconds + 's)' })
     if ($null -ne $Failure) { $lines += 'Harness failure: ' + $Failure }
     [IO.File]::WriteAllLines((Join-Path $OutputDirectory 'report.txt'), $lines, $Utf8)

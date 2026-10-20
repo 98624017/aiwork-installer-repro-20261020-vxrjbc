@@ -2,6 +2,11 @@
   "channelCode": "XINBAO-AI",
   "appGuid": "3b731237-98e1-50c0-957c-cc53cb848251",
   "expectedChannelName": "心宝Ai画板",
+  "channelSwitch": {
+    "channelCode": "HUIDA-AI",
+    "expectedChannelName": "绘达Ai画板",
+    "expectedIconSha256": "94f3f12f429003141eff8b8888693fd2a76a712a6f315e39723825a778c18f00"
+  },
   "candidate": {
     "file": "branding-setup.exe",
     "sha256": "f9ec2975852f7dd6a1cbbdf28d953959da5d398c9d718cbadcb5cf618986b707",
