@@ -18,6 +18,7 @@ public static class NativeLifecycleProbe {
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder value, int count);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder value, int count);
     [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode)]
@@ -29,6 +30,16 @@ public static class NativeLifecycleProbe {
         var window = new IntPtr(handle); uint pid; GetWindowThreadProcessId(window, out pid);
         if ((int)pid != expectedPid || !IsWindowVisible(window) || !IsWindowEnabled(window)) return false;
         UIntPtr unused; return SendButton(window, 0x00F5, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out unused) != IntPtr.Zero;
+    }
+
+    public static bool ShowUninstallDetails(long handle, int expectedPid) {
+        var window = new IntPtr(handle); uint pid; GetWindowThreadProcessId(window, out pid);
+        if ((int)pid != expectedPid) return false;
+        var cls = new StringBuilder(128); GetClassName(window, cls, cls.Capacity);
+        var id = GetDlgCtrlID(window);
+        if (!((id == 1016 && cls.ToString() == "SysListView32") || (id == 1027 && cls.ToString() == "Button"))) return false;
+        if (!IsWindowVisible(GetParent(window))) return false;
+        ShowWindow(window, 5); return IsWindowVisible(window);
     }
 
     private static LifecycleWindow Describe(IntPtr window, bool topLevel) {
@@ -132,7 +143,7 @@ function Get-LifecycleWindowEvidence([int[]]$ProcessIds, [string[]]$FixturePaths
 function Get-LifecycleUninstallDetails([object[]]$Windows, [string[]]$FixturePaths) {
     $rows = New-Object Collections.ArrayList
     $seen = New-Object 'Collections.Generic.HashSet[string]'
-    foreach ($window in @($Windows | Where-Object { $_.topLevel -and $_.visible -and $_.class -eq '#32770' })) {
+    foreach ($window in @($Windows | Where-Object { $_.visible -and (($_.topLevel -and $_.class -eq '#32770') -or ($_.id -eq 1016 -and $_.class -eq 'SysListView32')) })) {
         try {
             $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([long]$window.handle))
             if ($null -eq $root) { continue }
@@ -151,4 +162,21 @@ function Get-LifecycleUninstallDetails([object[]]$Windows, [string[]]$FixturePat
         }
     }
     return @($rows)
+}
+
+function New-LifecycleUninstallerCopy([string]$File) {
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('aiwork-uninstall-probe-' + [Guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $directory) { throw 'fresh-uninstaller-stage-required' }
+    New-Item -ItemType Directory -Path $directory | Out-Null
+    try {
+        $copy = Join-Path $directory 'old-uninstaller.exe'
+        Copy-Item -LiteralPath $File -Destination $copy
+        $sourceHash = (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash.ToLowerInvariant()
+        $copyHash = (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($sourceHash -cne $copyHash) { throw 'staged-uninstaller-hash-mismatch' }
+        return [ordered]@{ directory = $directory; executable = $copy; sourceSha256 = $sourceHash; copiedSha256 = $copyHash }
+    } catch {
+        Remove-Item -LiteralPath $directory -Recurse -Force
+        throw
+    }
 }

@@ -91,22 +91,31 @@ function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
 
 function Invoke-UpdatedUninstallDiagnostic([string]$File) {
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $staged = New-LifecycleUninstallerCopy $File
     $startedAt = [DateTime]::UtcNow
-    $child = Start-Process -FilePath $File -ArgumentList ('--updated /currentuser _?=' + $target) -PassThru
+    try {
+        $child = Start-Process -FilePath $staged.executable -ArgumentList ('/KEEP_APP_DATA --updated /currentuser _?=' + $target) -PassThru
+    } catch {
+        Remove-Item -LiteralPath $staged.directory -Recurse -Force
+        throw
+    }
     $ids = New-Object 'Collections.Generic.HashSet[int]'
     $ids.Add($child.Id) | Out-Null
     $handles = @{ $child.Id = $child }
     $observed = @{}
     $clicked = New-Object 'Collections.Generic.HashSet[string]'
-    $fixturePaths = @($File, $target, $env:RUNNER_TEMP, $env:TEMP, $env:USERPROFILE)
+    $fixturePaths = @($File, $staged.executable, $staged.directory, $target, $env:RUNNER_TEMP, $env:TEMP, $env:USERPROFILE)
     $diagnostic = [ordered]@{
-        mode = 'interactive-updated-uninstall'; outcome = 'not-completed'; exitCode = $null
+        mode = 'copied-interactive-updated-uninstall'; outcome = 'not-completed'; exitCode = $null
+        sourceUninstallerSha256 = $staged.sourceSha256; copiedUninstallerSha256 = $staged.copiedSha256
+        executableVolume = Get-LifecycleVolume $staged.executable
         elapsedSeconds = 0; processes = @(); actions = @(); firstDetails = @(); lastDetails = @(); windows = @(); cleanupErrors = @()
     }
+    $abortObservedAt = $null
     $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
         while ($timer.Elapsed.TotalSeconds -lt 45) {
-            $live = @(Get-LifecycleOwnedProcesses $ids $startedAt @(Get-CimInstance Win32_Process) $File)
+            $live = @(Get-LifecycleOwnedProcesses $ids $startedAt @(Get-CimInstance Win32_Process) $staged.executable)
             foreach ($item in $live) {
                 $processId = [int]$item.ProcessId
                 if (-not $observed.ContainsKey($processId)) { $observed[$processId] = Get-LifecycleProcessEvidence $item $child.Id }
@@ -122,6 +131,16 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
                 }
             }
             $windows = @(Get-LifecycleWindowEvidence @($live | ForEach-Object { [int]$_.ProcessId }) $fixturePaths)
+            foreach ($control in @($windows | Where-Object { ($_.id -eq 1027 -and $_.class -eq 'Button') -or ($_.id -eq 1016 -and $_.class -eq 'SysListView32') })) {
+                $key = 'details/' + [string]$control.handle
+                if (-not $clicked.Add($key)) { continue }
+                $shown = [NativeLifecycleProbe]::ShowUninstallDetails([long]$control.handle, [int]$control.ownerPid)
+                if (-not $shown) { $clicked.Remove($key) | Out-Null; continue }
+                $success = if ($shown -and $control.id -eq 1027) { [NativeLifecycleProbe]::Click([long]$control.handle, [int]$control.ownerPid) } else { $shown }
+                if (-not $success) { $clicked.Remove($key) | Out-Null }
+                $diagnostic.actions += [ordered]@{ elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2); action = 'show-uninstall-details'; controlId = $control.id; succeeded = $success }
+            }
+            $windows = @(Get-LifecycleWindowEvidence @($live | ForEach-Object { [int]$_.ProcessId }) $fixturePaths)
             $details = @(Get-LifecycleUninstallDetails $windows $fixturePaths)
             $diagnostic.windows = $windows
             if ($details.Count) {
@@ -129,9 +148,19 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
                 $diagnostic.lastDetails = $details
             }
             $terminal = @($windows | Where-Object { $_.class -eq 'Button' -and $_.enabled -and $_.visible -and $_.id -eq 1 -and $_.text -match '(?i)Close|Finish|Complete|\u5173\u95ed|\u5b8c\u6210' })
-            $failed = @($details | Where-Object { $_.Contains('text') -and $_.text -match '(?i)abort|failed|cannot|can.t|busy|error|\u5931\u8d25|\u9519\u8bef' })
-            if ($terminal.Count -and $failed.Count) { $diagnostic.outcome = 'abort-details-observed'; break }
+            $abort = @($windows | Where-Object { $_.class -eq 'Static' -and $_.visible -and $_.text -match '(?i)uninstall.*abort|can.t rename|cannot remove|\u5378\u8f7d\u4e2d\u6b62' })
+            $cancel = @($windows | Where-Object { $_.class -eq 'Button' -and $_.id -eq 2 -and $_.visible -and $_.enabled })
+            $nextDisabled = @($windows | Where-Object { $_.class -eq 'Button' -and $_.id -eq 1 -and $_.visible -and -not $_.enabled })
+            if ($abort.Count -and $cancel.Count -and $nextDisabled.Count) {
+                if ($null -eq $abortObservedAt) { $abortObservedAt = $timer.Elapsed.TotalSeconds }
+                if ($timer.Elapsed.TotalSeconds - $abortObservedAt -ge 2) { $diagnostic.outcome = 'abort-details-observed'; break }
+            }
             if ($child.WaitForExit(250)) { $diagnostic.exitCode = $child.ExitCode; $diagnostic.outcome = 'process-exited'; break }
+            if ($terminal.Count -and -not (Test-Path -LiteralPath (Join-Path $target 'ai-canvas.exe')) -and -not (Test-Path -LiteralPath (Join-Path $target 'resources/app.asar'))) {
+                $button = $terminal[0]
+                $success = [NativeLifecycleProbe]::Click([long]$button.handle, [int]$button.ownerPid)
+                $diagnostic.actions += [ordered]@{ elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2); action = 'finish-observed-removal'; controlId = $button.id; succeeded = $success }
+            }
             foreach ($button in @($windows | Where-Object { $_.class -eq 'Button' -and $_.enabled -and $_.visible -and $_.id -eq 1 -and $_.text -match '(?i)Uninstall|Next|\u5378\u8f7d|\u4e0b\u4e00\u6b65' })) {
                 $key = [string]$button.handle + '/' + $button.text
                 if (-not $clicked.Add($key)) { continue }
@@ -141,6 +170,7 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
         }
         $diagnostic.elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2)
         $diagnostic.processes = @($observed.Values | Sort-Object { $_.pid })
+        $diagnostic.applicationFilesRemaining = @('ai-canvas.exe', 'resources/app.asar' | Where-Object { Test-Path -LiteralPath (Join-Path $target $_) })
         return $diagnostic
     } finally {
         # Process handles were captured only after matching this invocation's CIM creation time.
@@ -149,6 +179,8 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
             catch { $diagnostic.cleanupErrors += $_.Exception.GetType().Name }
             finally { $handle.Dispose() }
         }
+        try { Remove-Item -LiteralPath $staged.directory -Recurse -Force }
+        catch { $diagnostic.cleanupErrors += $_.Exception.GetType().Name }
     }
 }
 
