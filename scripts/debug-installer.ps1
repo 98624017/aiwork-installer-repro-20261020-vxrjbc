@@ -107,7 +107,7 @@ try {
         $debuggerLog = Join-Path $OutputDirectory 'debugger-stack.txt'
         $commands = @(
             '.symfix "' + $symbolCache + '"'
-            'sxd -c2 ".echo AIWORK_UNHANDLED_AV; .exr -1; .ecxr; r; kv; lm; u @eip-20 L40; .echo AIWORK_STACK_END; q" av'
+            'sxd -c2 ".echo AIWORK_UNHANDLED_AV; .exr -1; .ecxr; r; kv; lm; u @eip-20 L40; .echo AIWORK_NSIS_STATE; dd setup+1e62c L1; dd poi(setup+1e62c)-4 L7; dd setup+7af30 L1; dd setup+7aef4 L1; .echo AIWORK_STACK_END; q" av'
             'g'
         )
         [IO.File]::WriteAllLines($commandFile, $commands, [Text.UTF8Encoding]::new($false))
