@@ -6,7 +6,7 @@ on:
       suite:
         type: choice
         default: branding
-        options: [branding, channel-switch, lifecycle, full, all, uninstall-diagnostic]
+        options: [branding, channel-switch, lifecycle, lifecycle-current, full, all, uninstall-diagnostic, uninstall-locked-directory]
 
 permissions:
   contents: read
@@ -48,11 +48,11 @@ jobs:
           if-no-files-found: error
 
   uninstall-diagnostic:
-    if: inputs.suite == 'uninstall-diagnostic'
+    if: inputs.suite == 'uninstall-diagnostic' || inputs.suite == 'uninstall-locked-directory'
     strategy:
       fail-fast: false
       matrix:
-        invocation: [interactive, silent]
+        invocation: ${{ inputs.suite == 'uninstall-locked-directory' && fromJSON('["locked-directory"]') || fromJSON('["interactive","silent"]') }}
     runs-on: windows-2025
     timeout-minutes: 6
     steps:
@@ -76,6 +76,7 @@ jobs:
           if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'requires-windows-powershell-51' }
           $test = @{ Mode = 'current-user'; UninstallUpdatedDiagnostic = $true }
           if ($env:DIAGNOSTIC_INVOCATION -eq 'silent') { $test.DiagnosticSilent = $true }
+          if ($env:DIAGNOSTIC_INVOCATION -eq 'locked-directory') { $test.DiagnosticDirectoryLock = $true }
           & ./scripts/verify-lifecycle.ps1 @test
           if (-not $?) { throw 'native-uninstall-diagnostic-failed' }
       - name: Upload sanitized uninstaller evidence
@@ -128,11 +129,11 @@ jobs:
           if-no-files-found: error
 
   lifecycle:
-    if: inputs.suite == 'lifecycle' || inputs.suite == 'all'
+    if: inputs.suite == 'lifecycle' || inputs.suite == 'lifecycle-current' || inputs.suite == 'all'
     strategy:
       fail-fast: false
       matrix:
-        mode: [direct, current-user, all-users]
+        mode: ${{ inputs.suite == 'lifecycle-current' && fromJSON('["current-user"]') || fromJSON('["direct","current-user","all-users"]') }}
     runs-on: windows-2025
     timeout-minutes: 10
     steps:
@@ -149,7 +150,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
       - name: Install, reinstall and uninstall
         timeout-minutes: 8
-        shell: pwsh
+        shell: powershell
         env:
           PROBE_MODE: ${{ matrix.mode }}
         run: |

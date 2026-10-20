@@ -2,7 +2,8 @@
 param(
     [ValidateSet('direct', 'current-user', 'all-users')][string]$Mode,
     [switch]$UninstallUpdatedDiagnostic,
-    [switch]$DiagnosticSilent
+    [switch]$DiagnosticSilent,
+    [switch]$DiagnosticDirectoryLock
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,15 +40,49 @@ function Test-Payload([string]$Target) {
     return $observed
 }
 
+function Get-SettledFileLockEvidence([string]$Target, [Diagnostics.Process]$Parent, [object[]]$OwnedProcesses, [long]$RootStartFileTime) {
+    $diagnostic = [ordered]@{ method = 'read-only-restart-manager'; status = 'not-started'; hardBudgetMilliseconds = 10000 }
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('aiwork-lock-probe-' + [Guid]::NewGuid().ToString('N'))
+    $probe = $null
+    try {
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+        $identities = Join-Path $directory 'identities.json'
+        $probeOutput = Join-Path $directory 'locks.json'
+        $safeIdentities = @($OwnedProcesses | ForEach-Object { [ordered]@{ pid = [int]$_.pid; createdAt = [string]$_.createdAt } })
+        [IO.File]::WriteAllText($identities, (ConvertTo-Json -InputObject $safeIdentities -Depth 3), $utf8)
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $PSScriptRoot 'file-lock-probe.ps1') + '" -TargetDirectory "' + $Target + '" -ParentProcessId ' + $Parent.Id + ' -ParentStartFileTime ' + $RootStartFileTime + ' -OwnedProcessIdentityPath "' + $identities + '" -OutputPath "' + $probeOutput + '" -BudgetMilliseconds 9000'
+        $probe = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+        if (-not $probe.WaitForExit(10000)) {
+            # This handle is only the bounded diagnostic child, never a reported lock holder.
+            $probe.Kill(); $null = $probe.WaitForExit(1000)
+            $diagnostic.status = 'hard-time-budget-exhausted'
+        } elseif (Test-Path -LiteralPath $probeOutput -PathType Leaf) {
+            $diagnostic = Get-Content -LiteralPath $probeOutput -Raw -Encoding UTF8 | ConvertFrom-Json
+        } else {
+            $diagnostic.status = 'probe-output-missing'
+        }
+    } catch {
+        $diagnostic = [ordered]@{ method = 'read-only-restart-manager'; status = 'failed'; errorType = $_.Exception.GetType().Name }
+    } finally {
+        if ($null -ne $probe) { $probe.Dispose() }
+        try { if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force } }
+        catch { $diagnostic | Add-Member -MemberType NoteProperty -Name cleanupErrorType -Value $_.Exception.GetType().Name -Force }
+    }
+    return $diagnostic
+}
+
 function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
     $startedAt = [DateTime]::UtcNow
     $child = Start-Process -FilePath $File -ArgumentList $Arguments -PassThru
+    $childStartFileTime = $child.StartTime.ToUniversalTime().ToFileTimeUtc()
     $ids = New-Object 'Collections.Generic.HashSet[int]'
     $ids.Add($child.Id) | Out-Null
     $observed = @{}
     $trace = New-Object Collections.ArrayList
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $lastLive = ''
+    $failureStage = ''
+    $fixturePaths = @($File, $target, $env:RUNNER_TEMP, $env:TEMP, $env:USERPROFILE)
     try {
         while ($timer.ElapsedMilliseconds -lt 180000) {
             $live = @(Get-LifecycleOwnedProcesses $ids $startedAt @(Get-CimInstance Win32_Process) $File)
@@ -62,11 +97,23 @@ function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
                 if ($trace.Count -gt 120) { $trace.RemoveAt(0) }
                 $lastLive = $liveKey
             }
+            if ($Arguments -match '(?i)(?:^|\s)/S(?:\s|$)') {
+                $windows = @(Get-LifecycleWindowEvidence @($live | ForEach-Object { [int]$_.ProcessId }) $fixturePaths)
+                $body = @($windows | Where-Object { $_.visible -and $_.class -eq 'Static' })
+                if (@($body | Where-Object { $_.text -match '(?i)Failed to uninstall old application files' }).Count) {
+                    $failureStage = 'parent-visible-uninstall-failure'
+                } elseif (@($body | Where-Object { $_.text -match '(?i)cannot be closed|can.t be closed|\u65e0\u6cd5\u5173\u95ed' }).Count -and
+                    @($windows | Where-Object { $_.visible -and $_.enabled -and $_.class -eq 'Button' -and ($_.id -eq 2 -or $_.id -eq 4) }).Count -ge 2) {
+                    $failureStage = 'parent-visible-app-close-failure'
+                }
+                if ($failureStage -ne '') { break }
+            }
             if ($child.WaitForExit(1000)) { break }
         }
-        if (-not $child.HasExited) {
-            $fixturePaths = @($File, $target, $env:RUNNER_TEMP, $env:TEMP, $env:USERPROFILE)
-            $report.timeoutWindow = Protect-LifecycleText ([string]$child.MainWindowTitle) $fixturePaths
+        if (-not $child.HasExited -or $failureStage -ne '' -or $child.ExitCode -ne 0) {
+            if ($failureStage -eq '') { $failureStage = if ($child.HasExited) { 'parent-nonzero-exit' } else { 'parent-timeout' } }
+            $report.installerFailureStage = $failureStage
+            $report.timeoutWindow = if ($child.HasExited) { '' } else { Protect-LifecycleText ([string]$child.MainWindowTitle) $fixturePaths }
             $report.timeoutProcesses = @($observed.Values | Sort-Object { $_.pid })
             $report.timeoutProcessTrace = @($trace)
             try {
@@ -82,10 +129,14 @@ function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
             } catch {
                 $report.timeoutDiagnosticsError = $_.Exception.GetType().Name
             }
-            $child.Kill()
-            throw 'installer-process-timeout'
+            $report.applicationFilesRemaining = @('ai-canvas.exe', 'resources/app.asar', 'Uninstall ai-canvas.exe' | Where-Object { Test-Path -LiteralPath (Join-Path $target $_) -PathType Leaf })
+            $report.targetDirectoryExists = Test-Path -LiteralPath $target -PathType Container
+            $report.fileLocksBeforeParentCleanup = Get-SettledFileLockEvidence $target $child @($observed.Values) $childStartFileTime
+            if (-not $child.HasExited) { $child.Kill() }
+            if ($failureStage -eq 'parent-timeout') { throw 'installer-process-timeout' }
+            if ($failureStage -eq 'parent-nonzero-exit') { throw 'installer-process-nonzero-exit' }
+            throw 'installer-visible-failure'
         }
-        if ($child.ExitCode -ne 0) { throw 'installer-process-nonzero-exit' }
         return $child.ExitCode
     } finally { $child.Dispose() }
 }
@@ -95,10 +146,18 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
     $staged = New-LifecycleUninstallerCopy $File
     $arguments = '/KEEP_APP_DATA --updated /currentuser _?=' + $target
     if ($DiagnosticSilent) { $arguments = '/S ' + $arguments }
+    $directoryHolder = $null
     $startedAt = [DateTime]::UtcNow
     try {
+        if ($DiagnosticDirectoryLock) {
+            $directoryHolder = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile -Command "Start-Sleep -Seconds 45"' -WorkingDirectory $target -WindowStyle Hidden -PassThru
+            $null = $directoryHolder.Handle
+        }
         $child = Start-Process -FilePath $staged.executable -ArgumentList $arguments -PassThru
     } catch {
+        if ($null -ne $directoryHolder) {
+            try { if (-not $directoryHolder.HasExited) { $directoryHolder.Kill(); $null = $directoryHolder.WaitForExit(1000) } } finally { $directoryHolder.Dispose() }
+        }
         Remove-Item -LiteralPath $staged.directory -Recurse -Force
         throw
     }
@@ -114,6 +173,13 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
         sourceUninstallerSha256 = $staged.sourceSha256; copiedUninstallerSha256 = $staged.copiedSha256
         executableVolume = Get-LifecycleVolume $staged.executable
         elapsedSeconds = 0; processes = @(); actions = @(); firstDetails = @(); lastDetails = @(); windows = @(); cleanupErrors = @()
+    }
+    if ($null -ne $directoryHolder) {
+        $diagnostic.directoryHolder = [ordered]@{
+            pid = $directoryHolder.Id; createdAt = $directoryHolder.StartTime.ToUniversalTime().ToString('o')
+            configuredWorkingDirectory = 'TEST_INSTALL'; configuredWorkingDirectoryMatchesTarget = $true
+            runningBeforeUninstaller = -not $directoryHolder.HasExited
+        }
     }
     $abortObservedAt = $null
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -175,6 +241,8 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
         $diagnostic.elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2)
         $diagnostic.processes = @($observed.Values | Sort-Object { $_.pid })
         $diagnostic.applicationFilesRemaining = @('ai-canvas.exe', 'resources/app.asar' | Where-Object { Test-Path -LiteralPath (Join-Path $target $_) })
+        $diagnostic.targetDirectoryExists = Test-Path -LiteralPath $target -PathType Container
+        if ($null -ne $directoryHolder) { $diagnostic.directoryHolder.runningAfterUninstaller = -not $directoryHolder.HasExited }
         return $diagnostic
     } finally {
         # Process handles were captured only after matching this invocation's CIM creation time.
@@ -183,6 +251,11 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
             catch { $diagnostic.cleanupErrors += $_.Exception.GetType().Name }
             finally { $handle.Dispose() }
         }
+        if ($null -ne $directoryHolder) {
+            try { if (-not $directoryHolder.HasExited) { $directoryHolder.Kill(); $null = $directoryHolder.WaitForExit(1000) } }
+            catch { $diagnostic.cleanupErrors += $_.Exception.GetType().Name }
+            finally { $directoryHolder.Dispose() }
+        }
         try { Remove-Item -LiteralPath $staged.directory -Recurse -Force }
         catch { $diagnostic.cleanupErrors += $_.Exception.GetType().Name }
     }
@@ -190,6 +263,7 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
 
 try {
     if ($DiagnosticSilent -and -not $UninstallUpdatedDiagnostic) { throw 'diagnostic-silent-requires-updated-uninstall-diagnostic' }
+    if ($DiagnosticDirectoryLock -and -not $UninstallUpdatedDiagnostic) { throw 'diagnostic-directory-lock-requires-updated-uninstall-diagnostic' }
     $report.setupSha256 = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($report.setupSha256 -cne $manifest.candidate.sha256) { throw 'setup-hash-mismatch' }
     & ./scripts/debug-installer.ps1 -Mode $Mode -InstallerPath $setup -OutputDirectory $output
