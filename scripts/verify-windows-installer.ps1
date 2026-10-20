@@ -443,6 +443,21 @@ function Test-VisibleLossWarning([object[]]$Windows) {
     return $false
 }
 
+function Get-LockedUninstallFailureButton([object[]]$Windows) {
+    foreach ($modal in @($Windows | Where-Object { $_.TopLevel -and $_.Enabled -and $_.ClassName -eq '#32770' })) {
+        $blocked = @($Windows | Where-Object { $_.OwnerPid -eq $modal.OwnerPid -and $_.TopLevel -and -not $_.Enabled -and $_.ClassName -eq '#32770' })
+        if ($blocked.Count -eq 0) { continue }
+        $children = @($Windows | Where-Object { [NativeInstallerProbe]::IsChild($modal.Handle, $_.Handle) })
+        $body = @($children | Where-Object { $_.ClassName -eq 'Static' -and -not [string]::IsNullOrWhiteSpace($_.Text) })
+        $buttons = @($children | Where-Object { $_.ClassName -eq 'Button' -and $_.Enabled })
+        if ($body.Count -eq 1 -and $body[0].Text -ceq $Labels.lockedUninstallFailureText -and
+            $buttons.Count -eq 1 -and $buttons[0].Id -in @(1, 2) -and $buttons[0].Text.Replace('&', '').Trim() -match $Labels.terminalOkPattern) {
+            return $buttons[0]
+        }
+    }
+    return $null
+}
+
 function Get-InstallerPageStage([object[]]$Windows) {
     $dialog = Get-ProcessDialogButtons $Windows
     if ($dialog.force.Count -gt 0) { return 'force-warning' }
@@ -459,6 +474,15 @@ function Add-InstallerTrace([Collections.ArrayList]$Trace, [Diagnostics.Stopwatc
     $Trace.Add([ordered]@{ elapsedSeconds = [Math]::Round($Timer.Elapsed.TotalSeconds, 2); stage = $Stage; action = $Action; transport = $Transport; controlId = $ControlId; succeeded = $Succeeded }) | Out-Null
     if ($Trace.Count -gt 160) { $Trace.RemoveAt(0) }
     $script:LastInstallerTrace = @($Trace)
+}
+
+function Get-InstallerFinishIdentity([object[]]$Windows, [object]$Button) {
+    $owned = @($Windows | Where-Object { $_.OwnerPid -eq $Button.OwnerPid -and $_.Enabled })
+    return [pscustomobject]@{
+        ownerPid = $Button.OwnerPid; buttonHandle = $Button.Handle
+        pages = (@($owned | Where-Object { $_.ClassName -eq '#32770' -and -not $_.TopLevel } | ForEach-Object { $_.Handle.ToInt64() } | Sort-Object) -join ',')
+        runBoxes = (@($owned | Where-Object { $_.ClassName -eq 'Button' -and (Get-UiLabel $_.Text) -eq 'wizard-run' } | ForEach-Object { $_.Handle.ToInt64() } | Sort-Object) -join ',')
+    }
 }
 
 function Confirm-InstallerRunCheckbox([object]$Box, [bool]$ShouldRun, [int]$TimeoutMilliseconds = 5000) {
@@ -508,6 +532,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
     $lastUi = @()
     $lastHandle = [IntPtr]::Zero
     $lastClickAt = [DateTime]::MinValue
+    $closingFinish = $null
     $retryCount = 0
     $normalCount = 0
     $forceCount = 0
@@ -554,15 +579,17 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
         $retry = $dialog.retry
         $chosen = $null
         $action = ''
+        $finishIdentity = $null
         $dialogText = ($lastUi | ForEach-Object { $_.Text }) -join ' '
+        $terminalButton = $null
+        if ($Scenario -eq 'replacement-lock') { $terminalButton = Get-LockedUninstallFailureButton $lastUi }
         if ($Scenario -eq 'replacement-lock' -and $dialogText -match $Labels.lockFailurePattern) {
             $cancel = @($buttons | Where-Object { ($_.Id -eq 2 -or $_.Id -eq 3) -and $_.Text.Replace('&', '') -match $Labels.cancelPattern })
             if ($cancel.Count -gt 0) { $chosen = $cancel[0]; $action = 'cancel-or-abort-locked-replacement' }
         }
-        elseif ($Scenario -eq 'replacement-lock' -and $dialogText -match 'Failed to uninstall old application files\.') {
+        elseif ($null -ne $terminalButton) {
             # electron-builder acknowledges this terminal error, then exits with code 2.
-            $acknowledge = @($buttons | Where-Object { $_.Id -eq 1 -and $_.Text.Replace('&', '') -match $Labels.okPattern })
-            if ($acknowledge.Count -gt 0) { $chosen = $acknowledge[0]; $action = 'acknowledge-terminal-uninstall-failure' }
+            $chosen = $terminalButton; $action = 'acknowledge-terminal-uninstall-failure'
         }
         elseif ($force.Count -gt 0) {
             Assert-True ($Mode -ne 'silent') 'silent-showed-force-dialog'
@@ -581,11 +608,21 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
             $chosen = $normal[0]; $action = 'normal-close'
         }
         elseif ($Mode -ne 'silent') {
-            foreach ($box in @($buttons | Where-Object { (Get-UiLabel $_.Text) -eq 'wizard-run' })) {
-                Confirm-InstallerRunCheckbox $box ($Mode -eq 'updated')
-            }
             $next = @($buttons | Where-Object { $_.Id -eq 1 -and (Get-UiLabel $_.Text) -eq 'wizard-next' })
-            if ($next.Count -gt 0) { $chosen = $next[0]; $action = 'wizard-next' }
+            $closingThisPage = $false
+            if ($next.Count -gt 0 -and $next[0].Text.Replace('&', '').Trim() -match $Labels.finishPattern) {
+                $finishIdentity = Get-InstallerFinishIdentity $lastUi $next[0]
+                $closingThisPage = $null -ne $closingFinish -and $closingFinish.ownerPid -eq $finishIdentity.ownerPid -and $closingFinish.buttonHandle -eq $finishIdentity.buttonHandle -and
+                    ($closingFinish.pages -ceq $finishIdentity.pages -or $finishIdentity.pages -ceq '') -and
+                    ($closingFinish.runBoxes -ceq $finishIdentity.runBoxes -or $finishIdentity.runBoxes -ceq '')
+            }
+            # A successful Finish post destroys its page asynchronously; wait for process exit.
+            if (-not $closingThisPage) {
+                foreach ($box in @($buttons | Where-Object { (Get-UiLabel $_.Text) -eq 'wizard-run' })) {
+                    Confirm-InstallerRunCheckbox $box ($Mode -eq 'updated')
+                }
+                if ($next.Count -gt 0) { $chosen = $next[0]; $action = 'wizard-next' }
+            }
         }
         if ($null -ne $chosen -and ($chosen.Handle -ne $lastHandle -or ([DateTime]::UtcNow - $lastClickAt).TotalSeconds -gt 2)) {
             if ($action -eq 'retry-normal-close') { $retryCount++; $warningCount++ }
@@ -597,6 +634,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
             $posted = if ($action -eq 'wizard-next') { [NativeInstallerProbe]::Command($chosen.Handle) } else { [NativeInstallerProbe]::Click($chosen.Handle) }
             Add-InstallerTrace $trace $timer $stage $action $transport $chosen.Id $posted
             Assert-True $posted 'button-post-failed'
+            if ($action -eq 'wizard-next' -and $null -ne $finishIdentity) { $closingFinish = $finishIdentity }
             $actions.Add($action) | Out-Null
             $lastHandle = $chosen.Handle
             $lastClickAt = [DateTime]::UtcNow
@@ -1113,10 +1151,13 @@ public static class ValidationFixture {
         cancel = [regex]::Unescape('\u53d6\u6d88\u5b89\u88c5')
         warning = [regex]::Unescape('\u5f3a\u5236\u5173\u95ed\u53ef\u80fd\u4e22\u5931\u672a\u4fdd\u5b58\u7684\u5185\u5bb9\uff0c\u5e76\u4e2d\u65ad\u6b63\u5728\u8fdb\u884c\u7684\u4efb\u52a1')
         nextPattern = [regex]::Unescape('^(\u4e0b\u4e00\u6b65|\u5b89\u88c5|\u5b8c\u6210|\u6211\u63a5\u53d7|Next|Install|Finish|I Agree)')
+        finishPattern = [regex]::Unescape('^(\u5b8c\u6210|Finish)(?:[ (]|$)')
         runPattern = [regex]::Unescape('^(\u8fd0\u884c|\u542f\u52a8|Run |Launch )')
         lockFailurePattern = [regex]::Unescape('(\u65e0\u6cd5\u5173\u95ed|cannot be closed|Error opening file for writing|Error creating file|error writing file)')
         cancelPattern = [regex]::Unescape('^(\u53d6\u6d88|\u4e2d\u6b62|\u7ec8\u6b62|Cancel|Abort)')
         okPattern = [regex]::Unescape('^(OK|\u786e\u5b9a)')
+        terminalOkPattern = [regex]::Unescape('^(OK|\u786e\u5b9a)$')
+        lockedUninstallFailureText = 'Failed to uninstall old application files. Please try running the installer again.: 2'
     }
     $ok = Invoke-Case 'native-ui-driver-self-test' {
         $observations = @{ visibleWindow = $true }

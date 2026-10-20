@@ -5,7 +5,7 @@ $driver = Join-Path $PSScriptRoot 'verify-windows-installer.ps1'
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($driver, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw 'driver-parse-error' }
-foreach ($name in @('Assert-True', 'Write-Json', 'Get-Payload', 'Get-SafeFailureEvidence', 'Save-InstallerExitEvidence', 'Invoke-FixtureCase', 'Invoke-Case', 'Test-OwnedInstallerIdentity', 'Test-OwnedInstallerParent', 'Stop-OwnedInstallerProcesses', 'Get-InstallerProcesses', 'Invoke-HarnessCleanup', 'Confirm-InstallerRunCheckbox', 'Get-ExpectedProcessFallback', 'Get-ProcessDialogButtons', 'Get-UiLabel', 'Get-SafeDialogText', 'Get-UiEvidence', 'Get-InstallerPageStage', 'Test-VisibleLossWarning')) {
+foreach ($name in @('Assert-True', 'Write-Json', 'Get-Payload', 'Get-SafeFailureEvidence', 'Save-InstallerExitEvidence', 'Invoke-FixtureCase', 'Invoke-Case', 'Test-OwnedInstallerIdentity', 'Test-OwnedInstallerParent', 'Stop-OwnedInstallerProcesses', 'Get-InstallerProcesses', 'Invoke-HarnessCleanup', 'Confirm-InstallerRunCheckbox', 'Get-ExpectedProcessFallback', 'Get-ProcessDialogButtons', 'Get-UiLabel', 'Get-SafeDialogText', 'Get-UiEvidence', 'Get-InstallerPageStage', 'Test-VisibleLossWarning', 'Get-LockedUninstallFailureButton')) {
     $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -288,13 +288,46 @@ public static class NativeInstallerProbe {
     public static bool State, Posted=true, Pending, ReadFails;
     public static int Reads, Clicks, ReadDelay, PendingReads;
     public static Dictionary<long,long> Parents=new Dictionary<long,long>();
+    public static bool UseSnapshots;
+    public static object[][] Snapshots=new object[0][];
+    public static long[] SnapshotRunHandles=new long[0];
+    public static int WindowsCalls, Commands, RequiredClicksAtThirdFrame, RequiredCommandsBeforeExit=1;
+    public static long CurrentRunHandle;
+    public static List<long> CheckedHandles=new List<long>(), ClickedHandles=new List<long>(), CommandHandles=new List<long>();
+    public static HashSet<long> DestroyedHandles=new HashSet<long>();
+    public static Dictionary<long,bool> CheckboxStates=new Dictionary<long,bool>();
     public static bool Checked(IntPtr h) {
+        if(UseSnapshots){
+            CheckedHandles.Add(h.ToInt64());
+            if(DestroyedHandles.Contains(h.ToInt64()))throw new InvalidOperationException("synthetic-closing-window-handle-destroyed");
+            return CheckboxStates[h.ToInt64()];
+        }
         Reads++;
         if(ReadFails)throw new InvalidOperationException("synthetic-state-read-failed");
         if(Pending && PendingReads--<=0){State=!State;Pending=false;}
         return State;
     }
-    public static bool Click(IntPtr h) { Clicks++;Pending=Posted;PendingReads=ReadDelay;return Posted; }
+    public static bool Click(IntPtr h) {
+        if(UseSnapshots){
+            if(DestroyedHandles.Contains(h.ToInt64()))return false;
+            ClickedHandles.Add(h.ToInt64());
+            if(CheckboxStates.ContainsKey(h.ToInt64()))CheckboxStates[h.ToInt64()]=!CheckboxStates[h.ToInt64()];
+            return true;
+        }
+        Clicks++;Pending=Posted;PendingReads=ReadDelay;return Posted;
+    }
+    public static bool Command(IntPtr h) {
+        Commands++;CommandHandles.Add(h.ToInt64());
+        if(CurrentRunHandle!=0)DestroyedHandles.Add(CurrentRunHandle);
+        return true;
+    }
+    public static object[] Windows(int[] ids) {
+        if(ids.Length==0)return new object[0];
+        int frame=WindowsCalls++;
+        if(frame>=2 && ClickedHandles.Count<RequiredClicksAtThirdFrame)throw new InvalidOperationException("synthetic-terminal-OK-was-not-acknowledged");
+        CurrentRunHandle=frame<SnapshotRunHandles.Length?SnapshotRunHandles[frame]:0;
+        return Snapshots[Math.Min(frame,Snapshots.Length-1)];
+    }
     public static bool IsChild(IntPtr parent, IntPtr child) { return Parents.ContainsKey(child.ToInt64()) && Parents[child.ToInt64()]==parent.ToInt64(); }
     public static int Resume(int pid) { return 0; }
 }
@@ -404,6 +437,135 @@ $windows += New-ProbeWindow 3001 65535 'Static' 'Unknown asset error' $false $tr
 $windows += New-ProbeWindow 3011 1 'Button' 'OK' $false $true 30
 $ui = @(Get-UiEvidence $windows)
 Check (@($ui | Where-Object { $_.Contains('processDialogKind') }).Count -eq 1 -and @($ui | Where-Object { $_.Contains('dialogText') -and -not $_.Contains('processDialogKind') }).Count -eq 1) 'known fallback cannot hide a separate unknown error modal'
+$terminalBody = 'Failed to uninstall old application files. Please try running the installer again.: 2'
+foreach ($id in @(1, 2)) {
+    $windows = @(New-DialogFixture $terminalBody @($id))
+    ($windows | Where-Object { $_.ClassName -eq 'Button' }).Text = 'OK'
+    Check ((Get-LockedUninstallFailureButton $windows).Id -eq $id) 'exact terminal error accepts the sole native OK button at ID 1 or 2'
+}
+foreach ($item in @(
+    @{ body = $terminalBody + ' unknown suffix'; ids = @(2); caption = 'OK' },
+    @{ body = 'Unknown asset error'; ids = @(2); caption = 'OK' },
+    @{ body = $terminalBody; ids = @(2, 6); caption = 'OK' },
+    @{ body = $terminalBody; ids = @(6); caption = 'OK' },
+    @{ body = $terminalBody; ids = @(2); caption = 'Cancel' }
+)) {
+    $windows = @(New-DialogFixture $item.body $item.ids)
+    foreach ($button in @($windows | Where-Object { $_.ClassName -eq 'Button' })) { $button.Text = $item.caption }
+    Check ($null -eq (Get-LockedUninstallFailureButton $windows)) 'terminal acknowledgement rejects unknown bodies, wrong IDs, extra buttons and non-OK captions'
+}
+$windows = @(New-DialogFixture $terminalBody @(2))
+($windows | Where-Object { $_.ClassName -eq 'Button' }).Text = 'OK'
+[NativeInstallerProbe]::Parents[[long]2012] = 99
+Check ($null -eq (Get-LockedUninstallFailureButton $windows)) 'terminal acknowledgement cannot borrow an OK button from another modal'
+$windows = @(New-DialogFixture $terminalBody @(2))
+($windows | Where-Object { $_.ClassName -eq 'Button' }).Text = 'OK'
+($windows | Where-Object { $_.TopLevel -and -not $_.Enabled }).Enabled = $true
+Check ($null -eq (Get-LockedUninstallFailureButton $windows)) 'terminal acknowledgement requires the owning blocked installer wizard'
+$savedExitEvidence = $LastInstallerExitEvidence; $savedRunEvidence = $LastRunCheckboxEvidence
+try {
+    & {
+        foreach ($name in @('Add-InstallerTrace', 'Get-InstallerFinishIdentity', 'Invoke-Installer')) {
+            $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+            . ([scriptblock]::Create($fn.Extent.Text))
+        }
+        $StartedAt = [DateTime]::UtcNow; $ChannelSwitch = $false; $FixtureProcess = $null; $ExpectedInstalled = $null
+        $OwnedInstallerIds = New-Object 'Collections.Generic.HashSet[int]'; $OwnedInstallerIdentities = @{}
+        $script:flowExitCode = 0; $script:flowRootExited = $true; $script:flowMainCount = 1; $script:flowReadyCalls = 0
+        function Start-Process {
+            param([string]$FilePath, [string]$ArgumentList, [switch]$PassThru)
+            $process = [pscustomobject]@{ Id = 77; Handle = [IntPtr]77; StartTime = [DateTime]::UtcNow; HasExited = $false; ExitCode = $script:flowExitCode }
+            $process | Add-Member ScriptMethod Refresh { $this.HasExited = $script:flowRootExited }
+            return $process
+        }
+        function Get-InstallerProcesses {
+            param([object]$Ids)
+            if ([NativeInstallerProbe]::WindowsCalls -lt [NativeInstallerProbe]::Snapshots.Length -or [NativeInstallerProbe]::Commands -lt [NativeInstallerProbe]::RequiredCommandsBeforeExit) { return [pscustomobject]@{ ProcessId = 77 } }
+        }
+        function Read-PackagedHelperEvidence { }
+        function Get-TargetProcesses {
+            for ($index = 0; $index -lt $script:flowMainCount; $index++) { [pscustomobject]@{ ProcessId = 900 + $index; CommandLine = 'fixture-main' } }
+        }
+        function Wait-ElectronMainReady {
+            param([int]$ProcessId, [int]$Seconds)
+            $script:flowReadyCalls++
+            return @{ fixtureReady = $true; processId = $ProcessId }
+        }
+        function Start-Sleep { param([int]$Milliseconds) Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 10 }
+        function Reset-Flow([object[][]]$Frames, [long[]]$RunHandles) {
+            [NativeInstallerProbe]::Snapshots = $Frames; [NativeInstallerProbe]::SnapshotRunHandles = $RunHandles
+            [NativeInstallerProbe]::WindowsCalls = 0; [NativeInstallerProbe]::Commands = 0; [NativeInstallerProbe]::RequiredClicksAtThirdFrame = 0
+            [NativeInstallerProbe]::RequiredCommandsBeforeExit = 1
+            [NativeInstallerProbe]::CheckedHandles.Clear(); [NativeInstallerProbe]::ClickedHandles.Clear(); [NativeInstallerProbe]::CommandHandles.Clear(); [NativeInstallerProbe]::DestroyedHandles.Clear()
+            [NativeInstallerProbe]::CheckboxStates.Clear(); [NativeInstallerProbe]::UseSnapshots = $true
+            foreach ($handle in $RunHandles) { if ($handle -ne 0) { [NativeInstallerProbe]::CheckboxStates[$handle] = $true } }
+            $script:flowExitCode = 0; $script:flowRootExited = $true; $script:flowMainCount = 1; $script:flowReadyCalls = 0
+        }
+        function New-FinishFrame([int]$PageHandle) {
+            New-ProbeWindow 100 0 '#32770' 'Wizard' $true $true
+            New-ProbeWindow $PageHandle 0 '#32770' 'Finish page' $false $true 100
+            New-ProbeWindow 101 1 'Button' 'Finish' $false $true 100
+            New-ProbeWindow ($PageHandle * 100 + 3) 1203 'Button' 'Run fixture' $false $true $PageHandle
+        }
+        $package = [pscustomobject]@{ path = 'FIXTURE_SETUP.exe'; sha256 = ('b' * 64) }
+        $finish = @(New-FinishFrame 21)
+        Reset-Flow @($finish, $finish) @(2103, 2103)
+        $failure = ''
+        try { $flow = Invoke-Installer $package 'updated' 'no-target' } catch { $failure = $_.Exception.GetType().Name + ':' + $_.Exception.Message }
+        Check ($failure -ceq '' -and [NativeInstallerProbe]::Commands -eq 1 -and [NativeInstallerProbe]::CheckedHandles.Count -eq 1 -and $flow.exitCode -eq 0 -and $flow.reopenedMainProcessCount -eq 1 -and $script:flowReadyCalls -eq 1) 'real installer loop never touches destroyed Finish controls after successful post and still verifies exit plus restart'
+        $nextFinish = @(New-FinishFrame 31)
+        Reset-Flow @($finish, $finish, $nextFinish) @(2103, 2103, 3103)
+        [NativeInstallerProbe]::RequiredCommandsBeforeExit = 2
+        $flow = Invoke-Installer $package 'updated' 'no-target'
+        Check ([NativeInstallerProbe]::Commands -eq 2 -and [NativeInstallerProbe]::CheckedHandles.Contains(3103)) 'a genuinely new Finish page rechecks its own run checkbox even when the outer Next HWND is reused'
+        $partial = @($finish | Where-Object { $_.Id -ne 1203 })
+        $closingFrames = New-Object 'Collections.Generic.List[object[]]'
+        $closingFrames.Add($finish)
+        for ($index = 0; $index -lt 220; $index++) { $closingFrames.Add($partial) }
+        Reset-Flow $closingFrames.ToArray() @(2103)
+        $flow = Invoke-Installer $package 'updated' 'no-target'
+        Check ([NativeInstallerProbe]::Commands -eq 1 -and [NativeInstallerProbe]::CheckedHandles.Count -eq 1) 'partially destroyed closing Finish page cannot trigger a second Finish post after the normal throttle expires'
+        $nextOne = @(New-FinishFrame 41 | Where-Object { $_.Id -ne 1203 })
+        $nextTwo = @(New-FinishFrame 42 | Where-Object { $_.Id -ne 1203 })
+        $lastFinish = @(New-FinishFrame 43)
+        foreach ($item in @(@{ windows = $nextOne; handle = 111; text = 'Next' }, @{ windows = $nextTwo; handle = 112; text = 'Install' }, @{ windows = $lastFinish; handle = 113; text = 'Finish' })) {
+            $button = $item.windows | Where-Object { $_.Id -eq 1 }
+            $button.Handle = [IntPtr]$item.handle; $button.Text = $item.text
+        }
+        Reset-Flow @($nextOne, $nextTwo, $lastFinish) @(0, 0, 4303)
+        [NativeInstallerProbe]::RequiredCommandsBeforeExit = 3
+        $flow = Invoke-Installer $package 'updated' 'no-target'
+        Check (([NativeInstallerProbe]::CommandHandles -join ',') -ceq '111,112,113' -and [NativeInstallerProbe]::CheckedHandles.Count -eq 1) 'ordinary Next and Install pages retain navigation before the confirmed Finish page'
+        foreach ($item in @(
+            @{ code = 2; exited = $true; mains = 1; expected = 'ASSERT:installer-nonzero-exit' },
+            @{ code = 0; exited = $false; mains = 1; expected = 'ASSERT:installer-tracking-ended-before-process-exit' },
+            @{ code = 0; exited = $true; mains = 2; expected = 'ASSERT:updated-did-not-reopen-one-main-process' }
+        )) {
+            Reset-Flow @($finish, $finish) @(2103, 2103)
+            $script:flowExitCode = $item.code; $script:flowRootExited = $item.exited; $script:flowMainCount = $item.mains
+            $failure = ''
+            try { Invoke-Installer $package 'updated' 'no-target' | Out-Null } catch { $failure = $_.Exception.Message }
+            Check ($failure -ceq $item.expected) 'closing Finish state preserves real process-exit, numeric exit-code and single-main-restart assertions'
+        }
+        $cancelFrame = @(New-DialogFixture 'Error opening file for writing' @(2))
+        $terminalFrame = @(
+            New-ProbeWindow 10 0 '#32770' 'Wizard' $true $false
+            New-ProbeWindow 30 0 '#32770' 'Terminal error' $true $true
+            New-ProbeWindow 3001 65535 'Static' 'Failed to uninstall old application files. Please try running the installer again.: 2' $false $true 30
+            New-ProbeWindow 3012 2 'Button' 'OK' $false $true 30
+        )
+        Reset-Flow @($cancelFrame, $terminalFrame, $terminalFrame) @(0, 0, 0)
+        [NativeInstallerProbe]::RequiredCommandsBeforeExit = 0; [NativeInstallerProbe]::RequiredClicksAtThirdFrame = 2
+        $script:flowExitCode = 2
+        $failure = ''
+        try { $flow = Invoke-Installer $package 'updated' 'replacement-lock' } catch { $failure = $_.Exception.GetType().Name + ':' + $_.Exception.Message }
+        Check ($failure -ceq '' -and $flow.exitCode -eq 2 -and $flow.actions -contains 'cancel-or-abort-locked-replacement' -and $flow.actions -contains 'acknowledge-terminal-uninstall-failure' -and [NativeInstallerProbe]::ClickedHandles.Contains(3012)) 'real lock flow acknowledges its exact terminal OK at native ID 2 and retains nonzero failure exit'
+    }
+}
+finally {
+    [NativeInstallerProbe]::UseSnapshots = $false
+    $script:LastInstallerExitEvidence = $savedExitEvidence; $script:LastRunCheckboxEvidence = $savedRunEvidence
+}
 function Stop-TargetProcesses { throw 'ASSERT:simulated-cim-cleanup-failure' }
 $topTry = $ast.Find({ param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $null -ne $n.Finally -and $n.Finally.Extent.Text.Contains('$Report.completedAt') }, $true)
 $cleanupText = $topTry.Finally.Extent.Text
