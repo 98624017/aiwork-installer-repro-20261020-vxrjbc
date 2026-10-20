@@ -49,6 +49,10 @@ jobs:
 
   uninstall-diagnostic:
     if: inputs.suite == 'uninstall-diagnostic'
+    strategy:
+      fail-fast: false
+      matrix:
+        invocation: [interactive, silent]
     runs-on: windows-2025
     timeout-minutes: 6
     steps:
@@ -65,15 +69,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
       - name: Record actual updated-uninstaller failure details
         timeout-minutes: 4
-        shell: pwsh
+        shell: powershell
+        env:
+          DIAGNOSTIC_INVOCATION: ${{ matrix.invocation }}
         run: |
-          & ./scripts/verify-lifecycle.ps1 -Mode current-user -UninstallUpdatedDiagnostic
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'requires-windows-powershell-51' }
+          $test = @{ Mode = 'current-user'; UninstallUpdatedDiagnostic = $true }
+          if ($env:DIAGNOSTIC_INVOCATION -eq 'silent') { $test.DiagnosticSilent = $true }
+          & ./scripts/verify-lifecycle.ps1 @test
           if (-not $?) { throw 'native-uninstall-diagnostic-failed' }
       - name: Upload sanitized uninstaller evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: branding-uninstall-diagnostic
+          name: branding-uninstall-diagnostic-${{ matrix.invocation }}
           path: lifecycle-evidence/
           retention-days: 7
           if-no-files-found: error

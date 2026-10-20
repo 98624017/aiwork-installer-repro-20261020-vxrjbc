@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [ValidateSet('direct', 'current-user', 'all-users')][string]$Mode,
-    [switch]$UninstallUpdatedDiagnostic
+    [switch]$UninstallUpdatedDiagnostic,
+    [switch]$DiagnosticSilent
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,9 +93,11 @@ function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
 function Invoke-UpdatedUninstallDiagnostic([string]$File) {
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
     $staged = New-LifecycleUninstallerCopy $File
+    $arguments = '/KEEP_APP_DATA --updated /currentuser _?=' + $target
+    if ($DiagnosticSilent) { $arguments = '/S ' + $arguments }
     $startedAt = [DateTime]::UtcNow
     try {
-        $child = Start-Process -FilePath $staged.executable -ArgumentList ('/KEEP_APP_DATA --updated /currentuser _?=' + $target) -PassThru
+        $child = Start-Process -FilePath $staged.executable -ArgumentList $arguments -PassThru
     } catch {
         Remove-Item -LiteralPath $staged.directory -Recurse -Force
         throw
@@ -106,7 +109,8 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
     $clicked = New-Object 'Collections.Generic.HashSet[string]'
     $fixturePaths = @($File, $staged.executable, $staged.directory, $target, $env:RUNNER_TEMP, $env:TEMP, $env:USERPROFILE)
     $diagnostic = [ordered]@{
-        mode = 'copied-interactive-updated-uninstall'; outcome = 'not-completed'; exitCode = $null
+        mode = if ($DiagnosticSilent) { 'copied-silent-updated-uninstall' } else { 'copied-interactive-updated-uninstall' }
+        outcome = 'not-completed'; exitCode = $null
         sourceUninstallerSha256 = $staged.sourceSha256; copiedUninstallerSha256 = $staged.copiedSha256
         executableVolume = Get-LifecycleVolume $staged.executable
         elapsedSeconds = 0; processes = @(); actions = @(); firstDetails = @(); lastDetails = @(); windows = @(); cleanupErrors = @()
@@ -185,6 +189,7 @@ function Invoke-UpdatedUninstallDiagnostic([string]$File) {
 }
 
 try {
+    if ($DiagnosticSilent -and -not $UninstallUpdatedDiagnostic) { throw 'diagnostic-silent-requires-updated-uninstall-diagnostic' }
     $report.setupSha256 = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($report.setupSha256 -cne $manifest.candidate.sha256) { throw 'setup-hash-mismatch' }
     & ./scripts/debug-installer.ps1 -Mode $Mode -InstallerPath $setup -OutputDirectory $output
