@@ -577,7 +577,7 @@ function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictSh
     if ($StrictShortcuts -and $gaps.Count -gt 0) { throw ('ASSERT:' + $gaps[0]) }
     Assert-True ((Get-Content -LiteralPath (Join-Path $AssetDirectory 'sentinel.txt') -Raw -Encoding UTF8) -eq 'external-asset-must-survive') 'external-assets-changed'
     $slug = if ($null -ne $binding.PSObject.Properties['channelSlug']) { [string]$binding.channelSlug } elseif ($null -ne $binding.PSObject.Properties['slug']) { [string]$binding.slug } else { '' }
-    return [ordered]@{ version = $version; productVersion = [string]$versionInfo.ProductVersion; nativeProductVersion = $nativeVersion; channelCode = $code; channelName = [string]$binding.channelName; channelSlug = $slug; mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; shortcutEvidence = $shortcutEvidence; hashes = $hashes }
+    return [ordered]@{ version = $version; productVersion = [string]$versionInfo.ProductVersion; nativeProductVersion = $nativeVersion; channelCode = $code; channelName = [string]$binding.channelName; channelSlugPresent = -not [string]::IsNullOrWhiteSpace($slug); mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; shortcutEvidence = $shortcutEvidence; hashes = $hashes }
 }
 
 function Assert-CandidateFiles {

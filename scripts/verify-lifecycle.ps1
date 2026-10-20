@@ -317,7 +317,23 @@ try {
     $sentinel = Join-Path $dataDirectory 'lifecycle-sentinel.txt'
     [IO.File]::WriteAllText($sentinel, 'owned-test-data', $utf8)
     $uninstaller = Join-Path $target 'Uninstall ai-canvas.exe'
-    $report.uninstallExit = Invoke-SettledInstaller $uninstaller ('/S _?=' + $target)
+    $stagedUninstaller = New-LifecycleUninstallerCopy $uninstaller
+    try {
+        $stagedExternal = -not [IO.Path]::GetFullPath($stagedUninstaller.executable).StartsWith(([IO.Path]::GetFullPath($target).TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)
+        if (-not $stagedExternal) { throw 'normal-uninstall-copy-not-external' }
+        $report.uninstallExecution = [ordered]@{
+            sourceUninstallerSha256 = $stagedUninstaller.sourceSha256
+            copiedUninstallerSha256 = $stagedUninstaller.copiedSha256
+            stagedExternal = $stagedExternal
+        }
+        $uninstallArguments = '/S '
+        if ($Mode -eq 'current-user') { $uninstallArguments += '/currentuser ' }
+        if ($Mode -eq 'all-users') { $uninstallArguments += '/allusers ' }
+        $uninstallArguments += '_?=' + $target
+        $report.uninstallExit = Invoke-SettledInstaller $stagedUninstaller.executable $uninstallArguments
+    } finally {
+        Remove-Item -LiteralPath $stagedUninstaller.directory -Recurse -Force
+    }
     if ((Test-Path -LiteralPath (Join-Path $target 'ai-canvas.exe')) -or (Test-Path -LiteralPath (Join-Path $target 'resources/app.asar'))) {
         throw 'uninstall-left-application-files'
     }

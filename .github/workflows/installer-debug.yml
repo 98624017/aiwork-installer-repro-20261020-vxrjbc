@@ -30,7 +30,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download branding-fixed-r2 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
+          gh release download branding-fixed-r3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
           gh release download candidate --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern baseline-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'baseline-download-failed' }
@@ -65,7 +65,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download branding-fixed-r2 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
+          gh release download branding-fixed-r3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
       - name: Record actual updated-uninstaller failure details
         timeout-minutes: 4
@@ -107,7 +107,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download branding-fixed-r2 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
+          gh release download branding-fixed-r3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
           gh release download candidate --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern baseline-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'baseline-download-failed' }
@@ -146,7 +146,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download branding-fixed-r2 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
+          gh release download branding-fixed-r3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
       - name: Install, reinstall and uninstall
         timeout-minutes: 8
@@ -183,7 +183,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download branding-fixed-r2 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
+          gh release download branding-fixed-r3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
           gh release download candidate --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern baseline-setup.exe --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'baseline-download-failed' }
