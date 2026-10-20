@@ -7,8 +7,8 @@ Set-StrictMode -Version 3.0
 $utf8 = [Text.UTF8Encoding]::new($false)
 $output = Join-Path $PWD 'lifecycle-evidence'
 New-Item -ItemType Directory -Path $output | Out-Null
-$manifest = Get-Content -LiteralPath './official-candidate.json' -Raw -Encoding UTF8 | ConvertFrom-Json
-$setup = (Resolve-Path -LiteralPath './payload/official-setup.exe').ProviderPath
+$manifest = Get-Content -LiteralPath './branding-candidate.json' -Raw -Encoding UTF8 | ConvertFrom-Json
+$setup = (Resolve-Path -LiteralPath (Join-Path './payload' $manifest.candidate.file)).ProviderPath
 $report = [ordered]@{
     mode = $Mode; status = 'failed'; image = $env:ImageOS; imageVersion = $env:ImageVersion
     powershell = [string]$PSVersionTable.PSVersion; setupSha256 = $null; stages = @(); errors = @()

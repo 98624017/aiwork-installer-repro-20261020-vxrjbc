@@ -2,12 +2,14 @@
 param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
     [Parameter(Mandatory = $true)][string]$PayloadDirectory,
-    [Parameter(Mandatory = $true)][string]$OutputDirectory
+    [Parameter(Mandatory = $true)][string]$OutputDirectory,
+    [switch]$BrandingOnly,
+    [switch]$FreshCandidate
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
-. (Join-Path $PSScriptRoot 'shortcut-probe.ps1')
+. (Join-Path $PSScriptRoot 'windows-shortcut-probe.ps1')
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $StartedAt = [DateTime]::UtcNow
 $Cases = New-Object System.Collections.ArrayList
@@ -28,7 +30,7 @@ $OriginalAppId = $null
 $FixtureProcess = $null
 $OtherProcess = $null
 $BackupExecutable = Join-Path $TestRoot 'protected-app-backup.exe'
-$ExpectedCaseCount = 18
+$ExpectedCaseCount = if ($BrandingOnly) { if ($FreshCandidate) { 4 } else { 5 } } else { 18 }
 $GracefulFixtureDelayMilliseconds = 6000
 $Report = [ordered]@{
     schemaVersion = 1
@@ -42,6 +44,8 @@ $Report = [ordered]@{
     host64Bit = [Environment]::Is64BitProcess
     os64Bit = [Environment]::Is64BitOperatingSystem
     channelCode = 'XINBAO-AI'
+    suite = if ($BrandingOnly) { 'branding' } else { 'full' }
+    installation = if ($FreshCandidate) { 'fresh-candidate' } else { 'baseline-upgrade' }
     cases = $Cases
     limitations = @(
         'Installer --updated mode is not the renderer-to-production-feed updater E2E.',
@@ -613,6 +617,7 @@ try {
     Assert-True ($PSVersionTable.PSEdition -eq 'Desktop' -and $PSVersionTable.PSVersion.Major -eq 5 -and $PSVersionTable.PSVersion.Minor -eq 1) 'requires-windows-powershell-51'
     Assert-True ([Environment]::OSVersion.Platform -eq 'Win32NT') 'requires-native-windows'
     Assert-True ([Environment]::Is64BitProcess) 'requires-native-64-bit-powershell-host'
+    Assert-True (-not $FreshCandidate -or $BrandingOnly) 'fresh-candidate-requires-branding-suite'
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ([string]$manifest.channelCode -eq 'XINBAO-AI') 'only-authorized-channel-supported'
     Assert-True ($null -ne $manifest.PSObject.Properties['appGuid'] -and [string]$manifest.appGuid -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') 'manifest-invalid-app-guid'
@@ -769,14 +774,17 @@ public static class ValidationFixture {
         return $observations
     }
     Assert-True $ok 'native-ui-prerequisite-failed'
-    $ok = Invoke-Case 'protected-baseline-fresh-interactive-real-channel' {
-        $flow = Invoke-Installer $Baseline 'standalone' 'no-target'
-        $identity = Assert-InstalledIdentity $Baseline $false
+    $firstPackage = if ($FreshCandidate) { $Candidate } else { $Baseline }
+    $firstCaseName = if ($FreshCandidate) { 'protected-candidate-fresh-interactive-real-channel' } else { 'protected-baseline-fresh-interactive-real-channel' }
+    $ok = Invoke-Case $firstCaseName {
+        $flow = Invoke-Installer $firstPackage 'standalone' 'no-target'
+        $identity = Assert-InstalledIdentity $firstPackage ([bool]$FreshCandidate)
         $script:OriginalAppId = $identity.appUserModelId
         return @{ flow = $flow; installed = $identity }
     }
     Assert-True $ok 'baseline-install-prerequisite-failed'
     Stop-TargetProcesses
+    if (-not $FreshCandidate) {
     $ok = Invoke-Case 'protected-old-to-candidate-upgrade-no-running-target' {
         $before = Get-InstalledHashes
         $flow = Invoke-Installer $Candidate 'standalone' 'no-target'
@@ -787,6 +795,7 @@ public static class ValidationFixture {
         return @{ flow = $flow; baselineHashes = $before; installed = $identity }
     }
     Assert-True $ok 'candidate-install-prerequisite-failed'
+    }
     Invoke-Case 'candidate-packaged-helpers-native-lf-parse-and-resolver-execution' {
         $helpers = @($PackagedHelpers.Values | Where-Object { $_.setupSha256 -eq $Candidate.sha256 })
         Assert-True ($helpers.Count -eq 4) 'candidate-packaged-helpers-not-observed'
@@ -795,8 +804,53 @@ public static class ValidationFixture {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $resolver.lfPath -StateDir $stateDir -ShortcutDiagnosticsOnly
         Assert-True ($LASTEXITCODE -eq 0) 'candidate-lf-resolver-execution-failed'
         Assert-True (Test-Path -LiteralPath (Join-Path $stateDir 'channel-install-diagnostics.json')) 'candidate-lf-resolver-diagnostics-missing'
-        return @{ helperCount = $helpers.Count; nativeLFResolverExitCode = $LASTEXITCODE; helpers = @($helpers | ForEach-Object { @{ filename = $_.filename; sha256 = $_.sha256; asciiSource = $_.asciiSource; lfParserErrors = $_.lfParserErrors } }) }
+        $shortcutHelper = @($helpers | Where-Object { $_.filename -eq 'installer-fix-shortcut-icon.ps1' })[0]
+        $shortcutDirectory = Join-Path $TestRoot ('Shortcut repair ' + [char]0x6D4B + [char]0x8BD5)
+        [IO.Directory]::CreateDirectory($shortcutDirectory) | Out-Null
+        $shortcutTarget = Join-Path $shortcutDirectory 'Target with spaces.exe'
+        Copy-Item -LiteralPath $FixtureExecutable -Destination $shortcutTarget
+        $shortcutName = [regex]::Unescape('\u5fc3\u5b9d Ai \u753b\u677f')
+        $shortcutNamePath = Join-Path $shortcutDirectory 'name.txt'
+        [IO.File]::WriteAllBytes($shortcutNamePath, [Text.Encoding]::Unicode.GetBytes($shortcutName))
+        $oldLink = Join-Path $shortcutDirectory 'Previous.lnk'
+        $newLink = Join-Path $shortcutDirectory ($shortcutName + '.lnk')
+        [ShortcutProbe]::WriteFixture($oldLink, $shortcutTarget, $shortcutDirectory)
+        $testAppId = 'com.xinbao.native-branding-selftest'
+        $shortcutIcon = Join-Path $InstallDirectory 'channel.ico'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File $shortcutHelper.lfPath -ShortcutPath $oldLink -ShortcutDirectory $shortcutDirectory -ShortcutNamePath $shortcutNamePath -TargetPath $shortcutTarget -WorkingDirectory $shortcutDirectory -IconPath $shortcutIcon -AppUserModelId $testAppId -RemoveShortcutPath $oldLink
+        Assert-True ($LASTEXITCODE -eq 0) 'candidate-lf-shortcut-helper-execution-failed'
+        $observed = [ShortcutProbe]::Read($newLink)
+        Assert-True ([string]::Equals($observed.TargetPath, $shortcutTarget, [StringComparison]::OrdinalIgnoreCase)) 'candidate-shortcut-helper-target-mismatch'
+        Assert-True ([string]::Equals($observed.WorkingDirectory, $shortcutDirectory, [StringComparison]::OrdinalIgnoreCase)) 'candidate-shortcut-helper-directory-mismatch'
+        Assert-True ([string]::Equals($observed.IconLocation, $shortcutIcon, [StringComparison]::OrdinalIgnoreCase)) 'candidate-shortcut-helper-icon-mismatch'
+        $shell = New-Object -ComObject Shell.Application
+        $item = $shell.Namespace($shortcutDirectory).ParseName([IO.Path]::GetFileName($newLink))
+        Assert-True ([string]$item.ExtendedProperty('System.AppUserModel.ID') -ceq $testAppId) 'candidate-shortcut-helper-appid-mismatch'
+        Assert-True (-not (Test-Path -LiteralPath $oldLink)) 'candidate-shortcut-helper-left-old-link'
+        [ShortcutProbe]::WriteFixture($oldLink, $shortcutTarget, $shortcutDirectory)
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File $shortcutHelper.lfPath -ShortcutPath $newLink -TargetPath (Join-Path $shortcutDirectory 'missing.exe') -RemoveShortcutPath $oldLink
+        Assert-True ($LASTEXITCODE -eq 10 -and (Test-Path -LiteralPath $oldLink)) 'candidate-shortcut-helper-failure-removed-old-link'
+        return @{ helperCount = $helpers.Count; nativeLFResolverExitCode = 0; nativeUnicodeShortcutRoundTrip = $true; failedRepairPreservesOldLink = $true; helpers = @($helpers | ForEach-Object { @{ filename = $_.filename; sha256 = $_.sha256; asciiSource = $_.asciiSource; lfParserErrors = $_.lfParserErrors } }) }
     } | Out-Null
+    if ($BrandingOnly) {
+        Invoke-Case 'actual-protected-electron-channel-branding' {
+            $app = Start-Process -FilePath $TargetExecutable -ArgumentList '--no-sandbox' -PassThru
+            try {
+                $readiness = Wait-ElectronMainReady $app.Id 60
+                $binding = Get-Content -LiteralPath (Join-Path $UserDataDirectory 'channel-binding.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+                Assert-True ([string]$binding.channelName -ceq [string]$manifest.expectedChannelName) 'runtime-channel-name-mismatch'
+                $deadline = [DateTime]::UtcNow.AddSeconds(20)
+                do {
+                    $windows = @([NativeInstallerProbe]::Windows([int[]]@($app.Id)))
+                    $branded = @($windows | Where-Object { $_.TopLevel -and $_.Text -ceq [string]$manifest.expectedChannelName })
+                    if ($branded.Count -gt 0) { break }
+                    Start-Sleep -Milliseconds 200
+                } while ([DateTime]::UtcNow -lt $deadline)
+                Assert-True ($branded.Count -gt 0) 'runtime-window-channel-title-mismatch'
+                return @{ readiness = $readiness; runtimeChannelName = [string]$binding.channelName; brandedNativeWindowCount = $branded.Count; installed = (Assert-InstalledIdentity) }
+            } finally { Stop-TargetProcesses }
+        } | Out-Null
+    } else {
     $ok = Invoke-Case 'installed-powershell-51-lf-only-helper' {
         $helper = Join-Path $InstallDirectory 'installer-manage-process.ps1'
         $bytes = [IO.File]::ReadAllBytes($helper)
@@ -921,6 +975,7 @@ public static class ValidationFixture {
         return $result
     } | Out-Null
     Invoke-Case 'final-real-channel-shortcuts-assets' { Assert-InstalledIdentity } | Out-Null
+    }
 }
 catch {
     $Failure = if ($_.Exception.Message -match '^ASSERT:([a-z0-9-]+)$') { $Matches[1] } else { 'unexpected-' + $_.Exception.GetType().Name }
@@ -955,3 +1010,4 @@ finally {
     [IO.File]::WriteAllLines((Join-Path $OutputDirectory 'report.txt'), $lines, $Utf8)
 }
 if ($Report.status -ne 'passed') { exit 1 }
+exit 0

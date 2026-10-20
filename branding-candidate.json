@@ -1,0 +1,20 @@
+{
+  "channelCode": "XINBAO-AI",
+  "appGuid": "3b731237-98e1-50c0-957c-cc53cb848251",
+  "expectedChannelName": "心宝Ai画板",
+  "candidate": {
+    "file": "branding-setup.exe",
+    "sha256": "ad8f484fa52662e6efb4d77658422faae16e864c61bb5d6707a4ab7ce0c8eb6f",
+    "version": "0.7.0",
+    "exeSha256": "2458ca4b921091e46d81f9526cf957140c41c2d0f23f6dc73f6db0c3f55dcf75",
+    "asarSha256": "74c244c75b587536df7be5dddef1e4a8089e5b2964f8bfbb39ba614c950497af",
+    "helperSha256": "83e0a240911e3183d4f1bf7dd88cfc0620d6d3a276d515b2b64ae5aa3328233b"
+  },
+  "baseline": {
+    "file": "baseline-setup.exe",
+    "sha256": "8c6e65404bb751ab674f70dc41a9a9ff2a9eb4f82ad69814a2251bb8f6d2102a",
+    "version": "0.7.0-beta.5",
+    "exeSha256": "e0be65cc094ebad16ec859b98f32f4be00dce487b2b05bc26af7cc8838f65233",
+    "asarSha256": "7c944745de8d2995d91057fb686fb47c78108a8dc91859e63882ef130d7c9f53"
+  }
+}
