@@ -4,10 +4,10 @@
   "expectedChannelName": "心宝Ai画板",
   "candidate": {
     "file": "branding-setup.exe",
-    "sha256": "ad8f484fa52662e6efb4d77658422faae16e864c61bb5d6707a4ab7ce0c8eb6f",
+    "sha256": "f9ec2975852f7dd6a1cbbdf28d953959da5d398c9d718cbadcb5cf618986b707",
     "version": "0.7.0",
-    "exeSha256": "2458ca4b921091e46d81f9526cf957140c41c2d0f23f6dc73f6db0c3f55dcf75",
-    "asarSha256": "74c244c75b587536df7be5dddef1e4a8089e5b2964f8bfbb39ba614c950497af",
+    "exeSha256": "b9ddbff4ab3ba0a98b59502846b1f7bcd34fd6c6c6ca9ca6515863e24b7fe699",
+    "asarSha256": "37539fcdb63590fc30e485009fe815dd8a27e970be7b18ace8f50531452be26f",
     "helperSha256": "83e0a240911e3183d4f1bf7dd88cfc0620d6d3a276d515b2b64ae5aa3328233b"
   },
   "baseline": {
