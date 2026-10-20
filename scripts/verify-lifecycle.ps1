@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param([ValidateSet('direct', 'current-user', 'all-users')][string]$Mode)
+param(
+    [ValidateSet('direct', 'current-user', 'all-users')][string]$Mode,
+    [switch]$UninstallUpdatedDiagnostic
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
@@ -13,6 +16,10 @@ $setup = (Resolve-Path -LiteralPath (Join-Path './payload' $manifest.candidate.f
 $report = [ordered]@{
     mode = $Mode; status = 'failed'; image = $env:ImageOS; imageVersion = $env:ImageVersion
     powershell = [string]$PSVersionTable.PSVersion; setupSha256 = $null; stages = @(); errors = @()
+    environment = [ordered]@{
+        tempVolume = Get-LifecycleVolume ([IO.Path]::GetTempPath())
+        targetVolume = Get-LifecycleVolume (Join-Path $env:RUNNER_TEMP 'diag-app')
+    }
 }
 
 function Test-Payload([string]$Target) {
@@ -82,6 +89,69 @@ function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
     } finally { $child.Dispose() }
 }
 
+function Invoke-UpdatedUninstallDiagnostic([string]$File) {
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $startedAt = [DateTime]::UtcNow
+    $child = Start-Process -FilePath $File -ArgumentList ('--updated /currentuser _?=' + $target) -PassThru
+    $ids = New-Object 'Collections.Generic.HashSet[int]'
+    $ids.Add($child.Id) | Out-Null
+    $handles = @{ $child.Id = $child }
+    $observed = @{}
+    $clicked = New-Object 'Collections.Generic.HashSet[string]'
+    $fixturePaths = @($File, $target, $env:RUNNER_TEMP, $env:TEMP, $env:USERPROFILE)
+    $diagnostic = [ordered]@{
+        mode = 'interactive-updated-uninstall'; outcome = 'not-completed'; exitCode = $null
+        elapsedSeconds = 0; processes = @(); actions = @(); firstDetails = @(); lastDetails = @(); windows = @(); cleanupErrors = @()
+    }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($timer.Elapsed.TotalSeconds -lt 45) {
+            $live = @(Get-LifecycleOwnedProcesses $ids $startedAt @(Get-CimInstance Win32_Process) $File)
+            foreach ($item in $live) {
+                $processId = [int]$item.ProcessId
+                if (-not $observed.ContainsKey($processId)) { $observed[$processId] = Get-LifecycleProcessEvidence $item $child.Id }
+                if (-not $handles.ContainsKey($processId)) {
+                    $handle = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                    if ($null -ne $handle) {
+                        try {
+                            if ([Math]::Abs(($handle.StartTime.ToUniversalTime() - $item.CreationDate.ToUniversalTime()).TotalMilliseconds) -gt 1) { $handle.Dispose(); continue }
+                            $null = $handle.Handle
+                            $handles[$processId] = $handle
+                        } catch { $handle.Dispose() }
+                    }
+                }
+            }
+            $windows = @(Get-LifecycleWindowEvidence @($live | ForEach-Object { [int]$_.ProcessId }) $fixturePaths)
+            $details = @(Get-LifecycleUninstallDetails $windows $fixturePaths)
+            $diagnostic.windows = $windows
+            if ($details.Count) {
+                if (-not $diagnostic.firstDetails.Count) { $diagnostic.firstDetails = $details }
+                $diagnostic.lastDetails = $details
+            }
+            $terminal = @($windows | Where-Object { $_.class -eq 'Button' -and $_.enabled -and $_.visible -and $_.id -eq 1 -and $_.text -match '(?i)Close|Finish|Complete|\u5173\u95ed|\u5b8c\u6210' })
+            $failed = @($details | Where-Object { $_.Contains('text') -and $_.text -match '(?i)abort|failed|cannot|can.t|busy|error|\u5931\u8d25|\u9519\u8bef' })
+            if ($terminal.Count -and $failed.Count) { $diagnostic.outcome = 'abort-details-observed'; break }
+            if ($child.WaitForExit(250)) { $diagnostic.exitCode = $child.ExitCode; $diagnostic.outcome = 'process-exited'; break }
+            foreach ($button in @($windows | Where-Object { $_.class -eq 'Button' -and $_.enabled -and $_.visible -and $_.id -eq 1 -and $_.text -match '(?i)Uninstall|Next|\u5378\u8f7d|\u4e0b\u4e00\u6b65' })) {
+                $key = [string]$button.handle + '/' + $button.text
+                if (-not $clicked.Add($key)) { continue }
+                $success = [NativeLifecycleProbe]::Click([long]$button.handle, [int]$button.ownerPid)
+                $diagnostic.actions += [ordered]@{ elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2); controlId = $button.id; text = $button.text; succeeded = $success }
+            }
+        }
+        $diagnostic.elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2)
+        $diagnostic.processes = @($observed.Values | Sort-Object { $_.pid })
+        return $diagnostic
+    } finally {
+        # Process handles were captured only after matching this invocation's CIM creation time.
+        foreach ($handle in $handles.Values) {
+            try { if (-not $handle.HasExited) { $handle.Kill(); $null = $handle.WaitForExit(5000) } }
+            catch { $diagnostic.cleanupErrors += $_.Exception.GetType().Name }
+            finally { $handle.Dispose() }
+        }
+    }
+}
+
 try {
     $report.setupSha256 = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($report.setupSha256 -cne $manifest.candidate.sha256) { throw 'setup-hash-mismatch' }
@@ -91,6 +161,7 @@ try {
         throw 'fresh-install-failed'
     }
     $target = [string]$initial.files.directory
+    $report.environment.targetVolume = Get-LifecycleVolume $target
     $report.freshHashes = Test-Payload $target
     $report.stages += 'fresh-install-hashes-passed'
 
@@ -115,6 +186,12 @@ try {
     if ($ownedLinks.Count -lt 2 -or @($links | Where-Object { -not $_.targetMatches -or -not $_.iconExists }).Count) {
         $report.errors += 'shortcut-contract-failed'
     } else { $report.stages += 'shortcut-targets-and-icons-passed' }
+
+    if ($UninstallUpdatedDiagnostic) {
+        $report.updatedUninstallDiagnostic = Invoke-UpdatedUninstallDiagnostic (Join-Path $target 'Uninstall ai-canvas.exe')
+        # This diagnostic branch deliberately never certifies the normal lifecycle suite.
+        throw 'updated-uninstall-diagnostic-only'
+    }
 
     $arguments = '/S '
     if ($Mode -eq 'current-user') { $arguments += '/currentuser ' }

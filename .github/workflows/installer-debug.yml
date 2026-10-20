@@ -6,12 +6,43 @@ on:
       suite:
         type: choice
         default: branding
-        options: [branding, lifecycle, full, all]
+        options: [branding, lifecycle, full, all, uninstall-diagnostic]
 
 permissions:
   contents: read
 
 jobs:
+  uninstall-diagnostic:
+    if: inputs.suite == 'uninstall-diagnostic'
+    runs-on: windows-2025
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Fetch hash-pinned protected candidate
+        timeout-minutes: 2
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download branding-fixed-r2 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern branding-setup.exe --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
+      - name: Record actual updated-uninstaller failure details
+        timeout-minutes: 4
+        shell: pwsh
+        run: |
+          & ./scripts/verify-lifecycle.ps1 -Mode current-user -UninstallUpdatedDiagnostic
+          if (-not $?) { throw 'native-uninstall-diagnostic-failed' }
+      - name: Upload sanitized uninstaller evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: branding-uninstall-diagnostic
+          path: lifecycle-evidence/
+          retention-days: 7
+          if-no-files-found: error
+
   branding:
     if: inputs.suite == 'branding' || inputs.suite == 'all'
     strategy:

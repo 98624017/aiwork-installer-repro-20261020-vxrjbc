@@ -22,6 +22,14 @@ public static class NativeLifecycleProbe {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder value, int count);
     [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode)]
     private static extern IntPtr ReadText(IntPtr window, uint message, UIntPtr count, StringBuilder value, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW")]
+    private static extern IntPtr SendButton(IntPtr window, uint message, UIntPtr value, IntPtr data, uint flags, uint timeout, out UIntPtr result);
+
+    public static bool Click(long handle, int expectedPid) {
+        var window = new IntPtr(handle); uint pid; GetWindowThreadProcessId(window, out pid);
+        if ((int)pid != expectedPid || !IsWindowVisible(window) || !IsWindowEnabled(window)) return false;
+        UIntPtr unused; return SendButton(window, 0x00F5, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out unused) != IntPtr.Zero;
+    }
 
     private static LifecycleWindow Describe(IntPtr window, bool topLevel) {
         uint pid; GetWindowThreadProcessId(window, out pid);
@@ -86,6 +94,12 @@ function Get-LifecycleOwnedProcesses([Collections.Generic.HashSet[int]]$Ids, [Da
     return @($recent | Where-Object { $Ids.Contains([int]$_.ProcessId) })
 }
 
+function Get-LifecycleVolume([string]$Path) {
+    $match = [regex]::Match($Path, '^([A-Za-z]:)[\\/]')
+    if ($match.Success) { return $match.Groups[1].Value.ToUpperInvariant() }
+    return 'unknown'
+}
+
 function Get-LifecycleProcessEvidence([object]$Process, [int]$RootId) {
     $helper = ''
     foreach ($name in @('installer-resolve-channel.ps1', 'installer-asset-library.ps1', 'installer-fix-shortcut-icon.ps1', 'installer-manage-process.ps1')) {
@@ -100,6 +114,7 @@ function Get-LifecycleProcessEvidence([object]$Process, [int]$RootId) {
     return [ordered]@{
         pid = [int]$Process.ProcessId; parentPid = [int]$Process.ParentProcessId
         name = [string]$Process.Name; role = $role; helper = $helper; action = $action
+        executableVolume = Get-LifecycleVolume ([string]$Process.ExecutablePath)
         createdAt = $Process.CreationDate.ToUniversalTime().ToString('o')
     }
 }
@@ -112,4 +127,28 @@ function Get-LifecycleWindowEvidence([int[]]$ProcessIds, [string[]]$FixturePaths
             text = Protect-LifecycleText $_.Text $FixturePaths
         }
     })
+}
+
+function Get-LifecycleUninstallDetails([object[]]$Windows, [string[]]$FixturePaths) {
+    $rows = New-Object Collections.ArrayList
+    $seen = New-Object 'Collections.Generic.HashSet[string]'
+    foreach ($window in @($Windows | Where-Object { $_.topLevel -and $_.visible -and $_.class -eq '#32770' })) {
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([long]$window.handle))
+            if ($null -eq $root) { continue }
+            $elements = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+            for ($index = $elements.Count - 1; $index -ge [Math]::Max(0, $elements.Count - 256); $index--) {
+                $element = $elements.Item($index)
+                $kind = $element.Current.ControlType
+                if ($kind -ne [System.Windows.Automation.ControlType]::ListItem -and $kind -ne [System.Windows.Automation.ControlType]::Text) { continue }
+                $text = Protect-LifecycleText ([string]$element.Current.Name) $FixturePaths
+                if (-not $text -or -not $seen.Add(([string]$window.ownerPid + '/' + $text))) { continue }
+                $rows.Add([ordered]@{ ownerPid = $window.ownerPid; type = $kind.ProgrammaticName; text = $text }) | Out-Null
+                if ($rows.Count -ge 128) { return @($rows) }
+            }
+        } catch {
+            $rows.Add([ordered]@{ ownerPid = $window.ownerPid; type = 'uia-error'; errorType = $_.Exception.GetType().Name }) | Out-Null
+        }
+    }
+    return @($rows)
 }

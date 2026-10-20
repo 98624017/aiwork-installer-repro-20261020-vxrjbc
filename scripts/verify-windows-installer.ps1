@@ -862,7 +862,7 @@ public static class ValidationFixture {
     } | Out-Null
     if ($BrandingOnly) {
         Invoke-Case 'actual-protected-electron-channel-branding' {
-            $app = Start-Process -FilePath $TargetExecutable -ArgumentList '--no-sandbox' -PassThru
+            $app = Start-Process -FilePath $TargetExecutable -PassThru
             try {
                 $readiness = Wait-ElectronMainReady $app.Id 60
                 $binding = Get-Content -LiteralPath (Join-Path $UserDataDirectory 'channel-binding.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -926,7 +926,7 @@ public static class ValidationFixture {
     Invoke-Case 'silent-stuck-target-no-force-no-replacement' { Invoke-FixtureCase 'silent' 'silent-block' } | Out-Null
     Invoke-Case 'actual-protected-electron-visible-window-and-force-upgrade' {
         Stop-TargetProcesses
-        $app = Start-Process -FilePath $TargetExecutable -ArgumentList '--no-sandbox' -PassThru
+        $app = Start-Process -FilePath $TargetExecutable -PassThru
         try {
             $readiness = Wait-ElectronMainReady $app.Id 60
             Assert-True ([NativeInstallerProbe]::Suspend($app.Id) -eq 0) 'real-app-suspend-failed'
