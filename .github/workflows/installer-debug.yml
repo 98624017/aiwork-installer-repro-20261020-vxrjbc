@@ -6,7 +6,7 @@ on:
       suite:
         type: choice
         default: all
-        options: [all, interactive, lifecycle]
+        options: [all, interactive, lifecycle, diagnostic]
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [direct, current-user, all-users]
+        mode: ${{ fromJSON(inputs.suite == 'diagnostic' && '["current-user"]' || '["direct", "current-user", "all-users"]') }}
     runs-on: windows-2025
     timeout-minutes: 10
     steps:
@@ -50,7 +50,7 @@ jobs:
           if-no-files-found: error
 
   interactive:
-    if: inputs.suite != 'lifecycle'
+    if: inputs.suite != 'lifecycle' && inputs.suite != 'diagnostic'
     strategy:
       fail-fast: false
       matrix:

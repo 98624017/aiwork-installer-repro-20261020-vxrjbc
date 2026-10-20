@@ -35,6 +35,16 @@ function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
     try {
         if (-not $child.WaitForExit(180000)) {
             $report.timeoutWindow = [string]$child.MainWindowTitle
+            Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+            $window = [System.Windows.Automation.AutomationElement]::FromHandle($child.MainWindowHandle)
+            if ($null -ne $window) {
+                $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+                $report.timeoutControls = @(foreach ($element in $elements) {
+                    if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -or $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) {
+                        [ordered]@{ type = $element.Current.ControlType.ProgrammaticName; text = $element.Current.Name }
+                    }
+                })
+            }
             $child.Kill()
             throw 'installer-process-timeout'
         }
