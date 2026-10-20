@@ -607,7 +607,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
             Assert-True ($Scenario -ne 'no-target') 'absent-target-showed-close-prompt'
             $chosen = $normal[0]; $action = 'normal-close'
         }
-        elseif ($Mode -ne 'silent') {
+        elseif ($Mode -ne 'silent' -and $stage -ne 'install-progress') {
             $next = @($buttons | Where-Object { $_.Id -eq 1 -and (Get-UiLabel $_.Text) -eq 'wizard-next' })
             $closingThisPage = $false
             if ($next.Count -gt 0 -and $next[0].Text.Replace('&', '').Trim() -match $Labels.finishPattern) {

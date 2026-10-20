@@ -294,11 +294,13 @@ public static class NativeInstallerProbe {
     public static int WindowsCalls, Commands, RequiredClicksAtThirdFrame, RequiredCommandsBeforeExit=1;
     public static long CurrentRunHandle;
     public static List<long> CheckedHandles=new List<long>(), ClickedHandles=new List<long>(), CommandHandles=new List<long>();
+    public static List<int> CheckedFrames=new List<int>(), CommandFrames=new List<int>();
     public static HashSet<long> DestroyedHandles=new HashSet<long>();
     public static Dictionary<long,bool> CheckboxStates=new Dictionary<long,bool>();
     public static bool Checked(IntPtr h) {
         if(UseSnapshots){
             CheckedHandles.Add(h.ToInt64());
+            CheckedFrames.Add(WindowsCalls);
             if(DestroyedHandles.Contains(h.ToInt64()))throw new InvalidOperationException("synthetic-closing-window-handle-destroyed");
             return CheckboxStates[h.ToInt64()];
         }
@@ -317,7 +319,7 @@ public static class NativeInstallerProbe {
         Clicks++;Pending=Posted;PendingReads=ReadDelay;return Posted;
     }
     public static bool Command(IntPtr h) {
-        Commands++;CommandHandles.Add(h.ToInt64());
+        Commands++;CommandHandles.Add(h.ToInt64());CommandFrames.Add(WindowsCalls);
         if(CurrentRunHandle!=0)DestroyedHandles.Add(CurrentRunHandle);
         return true;
     }
@@ -497,6 +499,7 @@ try {
             [NativeInstallerProbe]::WindowsCalls = 0; [NativeInstallerProbe]::Commands = 0; [NativeInstallerProbe]::RequiredClicksAtThirdFrame = 0
             [NativeInstallerProbe]::RequiredCommandsBeforeExit = 1
             [NativeInstallerProbe]::CheckedHandles.Clear(); [NativeInstallerProbe]::ClickedHandles.Clear(); [NativeInstallerProbe]::CommandHandles.Clear(); [NativeInstallerProbe]::DestroyedHandles.Clear()
+            [NativeInstallerProbe]::CheckedFrames.Clear(); [NativeInstallerProbe]::CommandFrames.Clear()
             [NativeInstallerProbe]::CheckboxStates.Clear(); [NativeInstallerProbe]::UseSnapshots = $true
             foreach ($handle in $RunHandles) { if ($handle -ne 0) { [NativeInstallerProbe]::CheckboxStates[$handle] = $true } }
             $script:flowExitCode = 0; $script:flowRootExited = $true; $script:flowMainCount = 1; $script:flowReadyCalls = 0
@@ -513,6 +516,11 @@ try {
         $failure = ''
         try { $flow = Invoke-Installer $package 'updated' 'no-target' } catch { $failure = $_.Exception.GetType().Name + ':' + $_.Exception.Message }
         Check ($failure -ceq '' -and [NativeInstallerProbe]::Commands -eq 1 -and [NativeInstallerProbe]::CheckedHandles.Count -eq 1 -and $flow.exitCode -eq 0 -and $flow.reopenedMainProcessCount -eq 1 -and $script:flowReadyCalls -eq 1) 'real installer loop never touches destroyed Finish controls after successful post and still verifies exit plus restart'
+        $mixedProgress = @(New-FinishFrame 21)
+        $mixedProgress += New-ProbeWindow 2199 1004 'msctls_progress32' '' $false $true 21
+        Reset-Flow @($mixedProgress, $finish) @(2103, 2103)
+        $flow = Invoke-Installer $package 'updated' 'no-target'
+        Check ([NativeInstallerProbe]::Commands -eq 1 -and [NativeInstallerProbe]::CheckedFrames.Count -eq 1 -and [NativeInstallerProbe]::CheckedFrames[0] -eq 2 -and [NativeInstallerProbe]::CommandFrames[0] -eq 2 -and $flow.reopenedMainProcessCount -eq 1) 'mixed progress/Finish snapshot waits for the complete Finish page before checking Run and posting navigation'
         $nextFinish = @(New-FinishFrame 31)
         Reset-Flow @($finish, $finish, $nextFinish) @(2103, 2103, 3103)
         [NativeInstallerProbe]::RequiredCommandsBeforeExit = 2
