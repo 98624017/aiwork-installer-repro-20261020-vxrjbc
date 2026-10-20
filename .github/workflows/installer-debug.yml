@@ -2,12 +2,18 @@ name: Verify official electron-builder installer
 
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        default: all
+        options: [all, interactive, lifecycle]
 
 permissions:
   contents: read
 
 jobs:
   lifecycle:
+    if: inputs.suite != 'interactive'
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +50,7 @@ jobs:
           if-no-files-found: error
 
   interactive:
+    if: inputs.suite != 'lifecycle'
     strategy:
       fail-fast: false
       matrix:

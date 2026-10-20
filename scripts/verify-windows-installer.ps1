@@ -762,7 +762,16 @@ public static class ValidationFixture {
         Copy-Item -LiteralPath $FixtureExecutable -Destination $roundTripExe
         $writerShell = New-Object -ComObject WScript.Shell
         $testLink = $writerShell.CreateShortcut($roundTripLink)
-        $testLink.TargetPath = $roundTripExe
+        try { $testLink.TargetPath = $roundTripExe }
+        catch {
+            $Report.shortcutReaderSelfTestFailure = [ordered]@{
+                stage = 'set-target-path'; exceptionType = $_.Exception.GetType().FullName
+                hresult = $_.Exception.HResult; syntheticTarget = $roundTripExe
+                targetType = $roundTripExe.GetType().FullName; targetExists = (Test-Path -LiteralPath $roundTripExe)
+                targetLength = $roundTripExe.Length; message = $_.Exception.Message
+            }
+            throw
+        }
         $testLink.WorkingDirectory = $roundTripDirectory
         $testLink.IconLocation = $roundTripExe + ',0'
         $testLink.Save()
