@@ -1,0 +1,83 @@
+name: Native Windows silent installer reproduction
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            scenario: original
+          - os: windows-2025
+            scenario: ascii
+          - os: windows-2025
+            scenario: spaces
+          - os: windows-2025
+            scenario: chinese
+          - os: windows-2025
+            scenario: baseline-ascii
+          - os: windows-2022
+            scenario: original
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Match the original runner tool environment
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global --no-audit --no-fund '@openai/codex@0.162.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Codex environment setup failed' }
+          npm install --no-audit --no-fund --no-save --package-lock=false 'playwright@1.59.1'
+          if ($LASTEXITCODE -ne 0) { throw 'Playwright environment setup failed' }
+          codex --version
+      - name: Download the exact authorized installer
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = $env:SCENARIO -eq 'baseline-ascii'
+          $asset = if ($baseline) { 'baseline-setup.exe' } else { 'candidate-setup.exe' }
+          $expectedHash = if ($baseline) { '8c6e65404bb751ab674f70dc41a9a9ff2a9eb4f82ad69814a2251bb8f6d2102a' } else { '3a6860d8d546055393c451f487f6240c5570f982b5038370978efc82cda8d091' }
+          gh release download candidate --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern $asset --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'Installer download failed' }
+          $installerPath = (Resolve-Path -LiteralPath (Join-Path 'payload' $asset)).Path
+          $actualHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw 'Installer SHA256 mismatch' }
+          "INSTALLER_PATH=$installerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Reproduce installation and collect native evidence
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parameters = @{ Scenario = $env:SCENARIO; InstallerPath = $env:INSTALLER_PATH; OutputDirectory = './evidence' }
+          if ($env:SCENARIO -ne 'baseline-ascii') {
+            $parameters.ExpectedAppExeSha256 = '0609c9bb440496e4e2c0bc697e6be06e1f9a2f70814949b50b67740860fb5cbf'
+            $parameters.ExpectedAppAsarSha256 = '73cbb1448374aa8b3ed473fc328816c07318229703134efda38bd0b65e3151ff'
+          }
+          & ./scripts/repro-installer.ps1 @parameters
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-${{ matrix.os }}-${{ matrix.scenario }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
