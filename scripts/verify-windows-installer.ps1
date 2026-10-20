@@ -18,6 +18,8 @@ $OwnedInstallerIds = New-Object 'System.Collections.Generic.HashSet[int]'
 $OwnedInstallerIdentities = @{}
 $LastInstallerInvocationIds = $null
 $LastInstallerInvocationStartedAt = [DateTime]::MinValue
+$LastInstallerExitEvidence = $null
+$LastRunCheckboxEvidence = $null
 $SuspendedIds = New-Object 'System.Collections.Generic.HashSet[int]'
 $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('aiwork-installer-validation-' + [Guid]::NewGuid().ToString('N'))
 $InstallDirectory = Join-Path (Join-Path $TestRoot ('Install with spaces ' + [char]0x6D4B + [char]0x8BD5)) 'ai-canvas'
@@ -115,14 +117,42 @@ function Get-TargetProcesses {
     })
 }
 
-function Stop-TargetProcesses {
-    foreach ($item in @(Get-TargetProcesses)) {
-        if ($SuspendedIds.Contains([int]$item.ProcessId)) {
-            [NativeInstallerProbe]::Resume([int]$item.ProcessId) | Out-Null
-            $SuspendedIds.Remove([int]$item.ProcessId) | Out-Null
+function Stop-TargetProcesses([int]$TimeoutMilliseconds = 10000) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $emptyChecks = 0
+    while ($timer.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+        $targets = @(Get-TargetProcesses)
+        if ($targets.Count -eq 0) {
+            $emptyChecks++
+            if ($emptyChecks -ge 2) { return }
         }
-        Stop-Process -Id ([int]$item.ProcessId) -Force -ErrorAction SilentlyContinue
+        else { $emptyChecks = 0 }
+        foreach ($item in $targets) {
+            $processId = [int]$item.ProcessId
+            $handle = Get-Process -Id $processId -ErrorAction SilentlyContinue
+            if ($null -eq $handle) { continue }
+            try {
+                $null = $handle.Handle
+                if ($null -eq $item.CreationDate -or
+                    [Math]::Abs($handle.StartTime.ToUniversalTime().ToFileTimeUtc() - $item.CreationDate.ToUniversalTime().ToFileTimeUtc()) -gt 10000 -or
+                    -not [string]::Equals([string]$handle.MainModule.FileName, $TargetExecutable, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                if ($SuspendedIds.Contains($processId)) {
+                    [NativeInstallerProbe]::Resume($processId) | Out-Null
+                    $SuspendedIds.Remove($processId) | Out-Null
+                }
+                if (-not $handle.HasExited) { $handle.Kill() }
+                $remaining = [int][Math]::Max(0, $TimeoutMilliseconds - $timer.ElapsedMilliseconds)
+                Assert-True ($remaining -gt 0 -and $handle.WaitForExit($remaining)) 'target-process-cleanup-exit-timeout'
+            }
+            catch {
+                $handle.Refresh()
+                if (-not $handle.HasExited) { throw }
+            }
+            finally { $handle.Dispose() }
+        }
+        Start-Sleep -Milliseconds 100
     }
+    throw 'ASSERT:target-process-cleanup-settlement-timeout'
 }
 
 function Get-SafeFailureEvidence([Management.Automation.ErrorRecord]$ErrorRecord) {
@@ -132,6 +162,18 @@ function Get-SafeFailureEvidence([Management.Automation.ErrorRecord]$ErrorRecord
         exceptionType = $ErrorRecord.Exception.GetType().FullName
         hresult = '0x{0:X8}' -f $ErrorRecord.Exception.HResult
         errorCategory = [string]$ErrorRecord.CategoryInfo.Category
+    }
+}
+
+function Save-InstallerExitEvidence([object]$Process, [string]$Mode, [string]$Scenario) {
+    $script:LastInstallerExitEvidence = [ordered]@{
+        mode = $Mode; scenario = $Scenario; hasExited = [bool]$Process.HasExited
+        exitCodePresent = $false; exitCode = $null
+    }
+    if ($LastInstallerExitEvidence.hasExited) {
+        $value = $Process.ExitCode
+        $LastInstallerExitEvidence.exitCodePresent = $null -ne $value
+        if ($null -ne $value) { $LastInstallerExitEvidence.exitCode = [int]$value }
     }
 }
 
@@ -208,6 +250,10 @@ function Invoke-HarnessCleanup {
 
 function Invoke-Case([string]$Name, [scriptblock]$Body) {
     $case = [ordered]@{ name = $Name; status = 'running'; elapsedSeconds = 0; observations = $null }
+    $priorInstallerExitEvidence = $LastInstallerExitEvidence
+    $priorRunCheckboxEvidence = $LastRunCheckboxEvidence
+    $priorUiEvidence = $null
+    if (Get-Variable LastUiEvidence -Scope Script -ErrorAction SilentlyContinue) { $priorUiEvidence = $script:LastUiEvidence }
     $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
         $case.observations = & $Body
@@ -224,6 +270,7 @@ function Invoke-Case([string]$Name, [scriptblock]$Body) {
         $case.failureLine = $_.InvocationInfo.ScriptLineNumber
         $case.exceptionType = $_.Exception.GetType().FullName
         $case.errorCategory = [string]$_.CategoryInfo.Category
+        if ((Get-Variable LastUiEvidence -Scope Script -ErrorAction SilentlyContinue) -and -not [object]::ReferenceEquals($script:LastUiEvidence, $priorUiEvidence)) { $case.uiEvidence = @($script:LastUiEvidence) }
         if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $case.installerTrace = $script:LastInstallerTrace }
         if (Get-Variable LastInstalledVersionEvidence -Scope Script -ErrorAction SilentlyContinue) { $case.installedVersion = $script:LastInstalledVersionEvidence }
         if (Get-Variable LastShortcutEvidence -Scope Script -ErrorAction SilentlyContinue) { $case.shortcutEvidence = $script:LastShortcutEvidence }
@@ -231,6 +278,8 @@ function Invoke-Case([string]$Name, [scriptblock]$Body) {
         Write-Host ('FAIL ' + $Name + ' [' + $case.failureCode + ']')
     }
     finally {
+        if ($null -ne $LastInstallerExitEvidence -and -not [object]::ReferenceEquals($LastInstallerExitEvidence, $priorInstallerExitEvidence)) { $case.installerExitEvidence = $LastInstallerExitEvidence }
+        if ($null -ne $LastRunCheckboxEvidence -and -not [object]::ReferenceEquals($LastRunCheckboxEvidence, $priorRunCheckboxEvidence)) { $case.runCheckboxEvidence = @($LastRunCheckboxEvidence) }
         if ($null -ne $LastFixtureCaseEvidence -and $LastFixtureCaseEvidence.caseName -ceq $Name) { $case.fixtureEvidence = $LastFixtureCaseEvidence }
         $case.elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2)
         $Cases.Add([pscustomobject]$case) | Out-Null
@@ -311,7 +360,50 @@ function Get-SafeDialogText([string]$Text) {
     return $safe.Substring(0, [Math]::Min(512, $safe.Length))
 }
 
+function Get-ExpectedProcessFallback([object[]]$Windows) {
+    foreach ($modal in @($Windows | Where-Object { $_.TopLevel -and $_.Enabled -and $_.ClassName -eq '#32770' })) {
+        $blockedWizard = @($Windows | Where-Object { $_.OwnerPid -eq $modal.OwnerPid -and $_.TopLevel -and -not $_.Enabled -and $_.ClassName -eq '#32770' })
+        if ($blockedWizard.Count -eq 0) { continue }
+        $children = @($Windows | Where-Object { [NativeInstallerProbe]::IsChild($modal.Handle, $_.Handle) })
+        $body = @($children | Where-Object { $_.ClassName -eq 'Static' -and -not [string]::IsNullOrWhiteSpace($_.Text) })
+        $buttons = @($children | Where-Object { $_.ClassName -eq 'Button' -and $_.Enabled })
+        if ($body.Count -ne 1) { continue }
+        $text = $body[0].Text.Replace("`r`n", "`n")
+        $ids = ($buttons | ForEach-Object { [int]$_.Id } | Sort-Object) -join ','
+        $kind = ''
+        if ($text -ceq $Labels.normalFallbackText.Replace("`r`n", "`n") -and $ids -ceq '1,2') { $kind = 'normal' }
+        if ($text -ceq $Labels.forceFallbackText.Replace("`r`n", "`n") -and $ids -ceq '2,6,7') { $kind = 'force' }
+        if ($kind -ne '') { return [pscustomobject]@{ kind = $kind; modalHandle = $modal.Handle; buttons = $buttons } }
+    }
+    return $null
+}
+
+function Get-ProcessDialogButtons([object[]]$Windows) {
+    $buttons = @($Windows | Where-Object { $_.ClassName -eq 'Button' -and $_.Enabled })
+    $result = [ordered]@{
+        normal = @($buttons | Where-Object { $_.Id -eq 4 -and (Get-UiLabel $_.Text) -eq 'normal' })
+        force = @($buttons | Where-Object { $_.Id -eq 6 -and (Get-UiLabel $_.Text) -eq 'force' })
+        retry = @($buttons | Where-Object { $_.Id -eq 4 -and (Get-UiLabel $_.Text) -eq 'retry' })
+        cancel = @($buttons | Where-Object { $_.Id -eq 2 -and (Get-UiLabel $_.Text) -eq 'cancel' })
+    }
+    $fallback = Get-ExpectedProcessFallback $Windows
+    if ($null -ne $fallback) {
+        $result.cancel = @($fallback.buttons | Where-Object { $_.Id -eq 2 })
+        if ($fallback.kind -eq 'normal') {
+            $result.normal = @($fallback.buttons | Where-Object { $_.Id -eq 1 })
+            $result.force = @(); $result.retry = @()
+        }
+        else {
+            $result.normal = @()
+            $result.force = @($fallback.buttons | Where-Object { $_.Id -eq 6 })
+            $result.retry = @($fallback.buttons | Where-Object { $_.Id -eq 7 })
+        }
+    }
+    return [pscustomobject]$result
+}
+
 function Get-UiEvidence([object[]]$Windows) {
+    $processFallback = Get-ExpectedProcessFallback $Windows
     $modals = @($Windows | Where-Object { $_.TopLevel -and $_.Enabled -and $_.ClassName -eq '#32770' })
     return @($Windows | ForEach-Object {
         $window = $_
@@ -320,6 +412,10 @@ function Get-UiEvidence([object[]]$Windows) {
             $item.buttonText = $_.Text.Substring(0, [Math]::Min(128, $_.Text.Length))
         }
         if ($window.ClassName -eq 'Static' -and -not [string]::IsNullOrWhiteSpace($window.Text)) {
+            if ($null -ne $processFallback -and [NativeInstallerProbe]::IsChild($processFallback.modalHandle, $window.Handle)) {
+                $item.dialogText = Get-SafeDialogText $window.Text
+                $item.processDialogKind = $processFallback.kind
+            }
             foreach ($modal in $modals) {
                 $blockedWizard = @($Windows | Where-Object { $_.OwnerPid -eq $modal.OwnerPid -and $_.TopLevel -and -not $_.Enabled -and $_.ClassName -eq '#32770' })
                 $ok = @($Windows | Where-Object { $_.ClassName -eq 'Button' -and $_.Enabled -and $_.Text.Replace('&', '').Trim() -match $Labels.okPattern -and [NativeInstallerProbe]::IsChild($modal.Handle, $_.Handle) })
@@ -348,8 +444,9 @@ function Test-VisibleLossWarning([object[]]$Windows) {
 }
 
 function Get-InstallerPageStage([object[]]$Windows) {
-    if (@($Windows | Where-Object { $_.Id -eq 6 -and (Get-UiLabel $_.Text) -eq 'force' }).Count -gt 0) { return 'force-warning' }
-    if (@($Windows | Where-Object { $_.Id -eq 4 -and (Get-UiLabel $_.Text) -eq 'normal' }).Count -gt 0) { return 'normal-close-prompt' }
+    $dialog = Get-ProcessDialogButtons $Windows
+    if ($dialog.force.Count -gt 0) { return 'force-warning' }
+    if ($dialog.normal.Count -gt 0) { return 'normal-close-prompt' }
     if (@($Windows | Where-Object { $_.Id -eq 1201 -and $_.ClassName -eq 'Edit' }).Count -gt 0 -and
         @($Windows | Where-Object { $_.Id -eq 1200 -and $_.ClassName -eq 'Static' }).Count -gt 0 -and
         @($Windows | Where-Object { $_.Id -eq 1202 -and $_.ClassName -eq 'Static' }).Count -gt 0) { return 'channel-input' }
@@ -364,6 +461,25 @@ function Add-InstallerTrace([Collections.ArrayList]$Trace, [Diagnostics.Stopwatc
     $script:LastInstallerTrace = @($Trace)
 }
 
+function Confirm-InstallerRunCheckbox([object]$Box, [bool]$ShouldRun, [int]$TimeoutMilliseconds = 5000) {
+    $evidence = [ordered]@{ controlId = $Box.Id; shouldRun = $ShouldRun; checkedBefore = $null; checkedAfter = $null; clickPosted = $null; confirmed = $false }
+    $LastRunCheckboxEvidence.Add($evidence) | Out-Null
+    $evidence.checkedBefore = [NativeInstallerProbe]::Checked($Box.Handle)
+    $evidence.checkedAfter = $evidence.checkedBefore
+    if ($evidence.checkedBefore -ne $ShouldRun) {
+        $evidence.clickPosted = [NativeInstallerProbe]::Click($Box.Handle)
+        Assert-True $evidence.clickPosted 'installer-run-checkbox-click-failed'
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $evidence.checkedAfter = [NativeInstallerProbe]::Checked($Box.Handle)
+            if ($evidence.checkedAfter -eq $ShouldRun) { break }
+            Start-Sleep -Milliseconds 50
+        } while ($timer.ElapsedMilliseconds -lt $TimeoutMilliseconds)
+    }
+    $evidence.confirmed = $evidence.checkedAfter -eq $ShouldRun
+    Assert-True $evidence.confirmed 'installer-run-checkbox-state-not-confirmed'
+}
+
 function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [string]$ChannelCode = 'XINBAO-AI', [string]$ExpectedPrefilledCode = '') {
     Assert-True (([DateTime]::UtcNow - $StartedAt).TotalMinutes -lt 25) 'overall-harness-time-budget-exhausted'
     Assert-True ($ChannelCode -ceq 'XINBAO-AI' -or ($ChannelSwitch -and $ChannelCode -ceq 'HUIDA-AI')) 'only-authorized-channel-supported'
@@ -371,6 +487,8 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
     if ($Mode -eq 'updated') { $arguments += '--updated --force-run ' }
     if ($Mode -eq 'silent') { $arguments += '/S ' }
     $arguments += '/D=' + $InstallDirectory
+    $script:LastInstallerExitEvidence = $null
+    $script:LastRunCheckboxEvidence = New-Object Collections.ArrayList
     $script:LastInstallerInvocationStartedAt = [DateTime]::UtcNow
     $process = Start-Process -FilePath $Package.path -ArgumentList $arguments -PassThru
     $null = $process.Handle
@@ -402,7 +520,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
         $lastUi = @([NativeInstallerProbe]::Windows([int[]]@($live | ForEach-Object { [int]$_.ProcessId })))
         if ($lastUi.Count -gt 0) {
             $script:LastUiEvidence = Get-UiEvidence $lastUi
-            if ($Scenario -ne 'replacement-lock' -and @($script:LastUiEvidence | Where-Object { $_.Contains('dialogText') }).Count -gt 0) {
+            if ($Scenario -ne 'replacement-lock' -and @($script:LastUiEvidence | Where-Object { $_.Contains('dialogText') -and -not $_.Contains('processDialogKind') }).Count -gt 0) {
                 throw 'ASSERT:unexpected-installer-modal'
             }
         }
@@ -430,9 +548,10 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
             if ((Get-Hash $TargetExecutable) -eq $ExpectedInstalled.exe) { $replacementWhileFixtureAlive = $true }
         }
         $buttons = @($lastUi | Where-Object { $_.ClassName -eq 'Button' -and $_.Enabled })
-        $force = @($buttons | Where-Object { $_.Id -eq 6 -and (Get-UiLabel $_.Text) -eq 'force' })
-        $normal = @($buttons | Where-Object { $_.Id -eq 4 -and (Get-UiLabel $_.Text) -eq 'normal' })
-        $retry = @($buttons | Where-Object { $_.Id -eq 4 -and (Get-UiLabel $_.Text) -eq 'retry' })
+        $dialog = Get-ProcessDialogButtons $lastUi
+        $force = $dialog.force
+        $normal = $dialog.normal
+        $retry = $dialog.retry
         $chosen = $null
         $action = ''
         $dialogText = ($lastUi | ForEach-Object { $_.Text }) -join ' '
@@ -448,7 +567,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
         elseif ($force.Count -gt 0) {
             Assert-True ($Mode -ne 'silent') 'silent-showed-force-dialog'
             Assert-True ($retry.Count -gt 0) 'force-dialog-retry-missing'
-            $cancel = @($buttons | Where-Object { $_.Id -eq 2 -and (Get-UiLabel $_.Text) -eq 'cancel' })
+            $cancel = $dialog.cancel
             Assert-True ($cancel.Count -gt 0) 'force-dialog-cancel-missing'
             Assert-True (Test-VisibleLossWarning $lastUi) 'force-dialog-loss-warning-missing'
             if ($Scenario -eq 'cancel') { $chosen = $cancel[0]; $action = 'cancel-after-warning' }
@@ -463,8 +582,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
         }
         elseif ($Mode -ne 'silent') {
             foreach ($box in @($buttons | Where-Object { (Get-UiLabel $_.Text) -eq 'wizard-run' })) {
-                $shouldRun = $Mode -eq 'updated'
-                if ([NativeInstallerProbe]::Checked($box.Handle) -ne $shouldRun) { [NativeInstallerProbe]::Click($box.Handle) | Out-Null }
+                Confirm-InstallerRunCheckbox $box ($Mode -eq 'updated')
             }
             $next = @($buttons | Where-Object { $_.Id -eq 1 -and (Get-UiLabel $_.Text) -eq 'wizard-next' })
             if ($next.Count -gt 0) { $chosen = $next[0]; $action = 'wizard-next' }
@@ -496,6 +614,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
         throw 'ASSERT:installer-timeout'
     }
     $process.Refresh()
+    Save-InstallerExitEvidence $process $Mode $Scenario
     Assert-True $process.HasExited 'installer-tracking-ended-before-process-exit'
     Assert-True (-not $replacementWhileFixtureAlive) 'replacement-before-fixture-exit'
     if ($Scenario -eq 'replacement-lock') {
@@ -947,7 +1066,7 @@ public static class NativeInstallerProbe {
     public static bool SetText(IntPtr h, string text) { IntPtr result; return SendTextTimeout(h,0xC,IntPtr.Zero,text,2,1000,out result)!=IntPtr.Zero && result!=IntPtr.Zero; }
     public static bool TextEquals(IntPtr h, string expected) { IntPtr result; StringBuilder text=new StringBuilder(64); return ReadTextTimeout(h,0xD,new IntPtr(text.Capacity),text,2,1000,out result)!=IntPtr.Zero && text.ToString()==expected; }
     public static string LongPath(string path) { StringBuilder output=new StringBuilder(32768); uint length=GetLongPathName(path,output,(uint)output.Capacity); return length>0 && length<output.Capacity ? output.ToString() : path; }
-    public static bool Checked(IntPtr h) { IntPtr result; SendMessageTimeout(h, 0xF0, IntPtr.Zero, IntPtr.Zero, 2, 1000, out result); return result.ToInt64()==1; }
+    public static bool Checked(IntPtr h) { IntPtr result; if(SendMessageTimeout(h,0xF0,IntPtr.Zero,IntPtr.Zero,2,1000,out result)==IntPtr.Zero || (result.ToInt64()!=0 && result.ToInt64()!=1))throw new InvalidOperationException("checkbox-state-read-failed"); return result.ToInt64()==1; }
     public static int Suspend(int pid) { IntPtr h=OpenProcess(0x800,false,pid); if(h==IntPtr.Zero)return -1; try{return NtSuspendProcess(h);}finally{CloseHandle(h);} }
     public static int Resume(int pid) { IntPtr h=OpenProcess(0x800,false,pid); if(h==IntPtr.Zero)return -1; try{return NtResumeProcess(h);}finally{CloseHandle(h);} }
 }
@@ -986,6 +1105,8 @@ public static class ValidationFixture {
     $compiler.Dispose()
     $Report.fixtureArchitecture = 'x64'
     $Labels = @{
+        normalFallbackText = [regex]::Unescape('\u8f6f\u4ef6\u6b63\u5728\u8fd0\u884c\uff0c\u8bf7\u5148\u5173\u95ed\u8f6f\u4ef6\u540e\u7ee7\u7eed\u3002\r\n\r\n\u786e\u5b9a\uff1a\u5173\u95ed\u8f6f\u4ef6\u5e76\u7ee7\u7eed\r\n\u53d6\u6d88\uff1a\u53d6\u6d88\u5b89\u88c5')
+        forceFallbackText = [regex]::Unescape('\u8f6f\u4ef6\u4ecd\u5728\u8fd0\u884c\u3002\u5f3a\u5236\u5173\u95ed\u53ef\u80fd\u4e22\u5931\u672a\u4fdd\u5b58\u7684\u5185\u5bb9\uff0c\u5e76\u4e2d\u65ad\u6b63\u5728\u8fdb\u884c\u7684\u4efb\u52a1\u3002\r\n\r\n\u662f\uff1a\u5f3a\u5236\u5173\u95ed\u5e76\u5347\u7ea7\r\n\u5426\uff1a\u91cd\u8bd5\u6b63\u5e38\u5173\u95ed\r\n\u53d6\u6d88\uff1a\u53d6\u6d88\u5b89\u88c5')
         normal = [regex]::Unescape('\u5173\u95ed\u8f6f\u4ef6\u5e76\u7ee7\u7eed')
         retry = [regex]::Unescape('\u91cd\u8bd5\u6b63\u5e38\u5173\u95ed')
         force = [regex]::Unescape('\u5f3a\u5236\u5173\u95ed\u5e76\u5347\u7ea7')
@@ -1260,6 +1381,7 @@ finally {
     $Report.status = if ($null -eq $Failure -and $Report.failedCaseCount -eq 0 -and $Cases.Count -eq $ExpectedCaseCount -and $Report.cleanupFailures.Count -eq 0) { 'passed' } else { 'failed' }
     if (Get-Variable LastUiEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastUi = $script:LastUiEvidence }
     if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstallerTrace = $script:LastInstallerTrace }
+    if ($null -ne $LastInstallerExitEvidence) { $Report.lastInstallerExitEvidence = $LastInstallerExitEvidence }
     if (Get-Variable LastInstalledVersionEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstalledVersion = $script:LastInstalledVersionEvidence }
     if (Get-Variable LastShortcutEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastShortcutEvidence = $script:LastShortcutEvidence }
     if (Get-Variable LastLockCaseEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lockEvidence = $script:LastLockCaseEvidence }

@@ -5,7 +5,7 @@ $driver = Join-Path $PSScriptRoot 'verify-windows-installer.ps1'
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($driver, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw 'driver-parse-error' }
-foreach ($name in @('Assert-True', 'Write-Json', 'Get-Payload', 'Get-SafeFailureEvidence', 'Invoke-FixtureCase', 'Invoke-Case', 'Test-OwnedInstallerIdentity', 'Test-OwnedInstallerParent', 'Stop-OwnedInstallerProcesses', 'Get-InstallerProcesses', 'Invoke-HarnessCleanup')) {
+foreach ($name in @('Assert-True', 'Write-Json', 'Get-Payload', 'Get-SafeFailureEvidence', 'Save-InstallerExitEvidence', 'Invoke-FixtureCase', 'Invoke-Case', 'Test-OwnedInstallerIdentity', 'Test-OwnedInstallerParent', 'Stop-OwnedInstallerProcesses', 'Get-InstallerProcesses', 'Invoke-HarnessCleanup', 'Confirm-InstallerRunCheckbox', 'Get-ExpectedProcessFallback', 'Get-ProcessDialogButtons', 'Get-UiLabel', 'Get-SafeDialogText', 'Get-UiEvidence', 'Get-InstallerPageStage', 'Test-VisibleLossWarning')) {
     $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -13,6 +13,8 @@ $FixtureExecutable = 'FIXTURE.exe'; $TargetExecutable = 'TEST_INSTALL/ai-canvas.
 $ExpectedInstalled = @{ exe = ('a' * 64); asar = 'asar'; helper = 'helper' }; $Candidate = @{}
 $GracefulFixtureDelayMilliseconds = 6000
 $Cases = New-Object Collections.ArrayList
+$LastInstallerExitEvidence = $null
+$LastRunCheckboxEvidence = $null
 function Stop-TargetProcesses { $script:events.Add('stop-target-query') | Out-Null }
 function Copy-Item {
     param([string]$LiteralPath, [string]$Destination, [switch]$Force)
@@ -208,7 +210,200 @@ try {
     Pop-Location
     Remove-Item -LiteralPath $payloadFixtureRoot -Recurse -Force
 }
-if (-not ('NativeInstallerProbe' -as [type])) { Add-Type -TypeDefinition 'public static class NativeInstallerProbe { public static int Resume(int pid) { return 0; } }' }
+foreach ($item in @(
+    @{ name = 'zero'; hasExited = $true; code = 0; succeeds = $true },
+    @{ name = 'nonzero'; hasExited = $true; code = 2; succeeds = $false },
+    @{ name = 'signed-native-failure'; hasExited = $true; code = -1073741819; succeeds = $false },
+    @{ name = 'missing-code'; hasExited = $true; code = $null; succeeds = $false },
+    @{ name = 'still-running'; hasExited = $false; code = $null; succeeds = $false }
+)) {
+    $exitProcess = [pscustomobject]@{ HasExited = $item.hasExited; ExitCode = $item.code }
+    if (-not $item.hasExited) { $exitProcess | Add-Member -MemberType ScriptProperty -Name ExitCode -Value { throw 'exit-code-must-not-be-read-while-running' } -Force }
+    $ok = Invoke-Case ('fixture-installer-exit-' + $item.name) {
+        Save-InstallerExitEvidence $exitProcess 'standalone' 'no-target'
+        Assert-True $exitProcess.HasExited 'installer-tracking-ended-before-process-exit'
+        Assert-True ($exitProcess.ExitCode -eq 0) 'installer-nonzero-exit'
+    } 6>$null
+    $savedExit = $Cases[-1].installerExitEvidence
+    Check ($ok -eq $item.succeeds -and $savedExit.hasExited -eq $item.hasExited -and $savedExit.exitCodePresent -eq ($null -ne $item.code) -and $savedExit.exitCode -ceq $item.code -and $savedExit.mode -ceq 'standalone' -and $savedExit.scenario -ceq 'no-target') ('failed and successful cases retain exact exit evidence: ' + $item.name)
+}
+& {
+    foreach ($name in @('Get-TargetProcesses', 'Stop-TargetProcesses')) {
+        $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+    $SuspendedIds = New-Object 'Collections.Generic.HashSet[int]'
+    $script:targetEvents = New-Object Collections.ArrayList
+    $script:targetHandles = @{}
+    $script:targetQueryCount = 0; $script:targetTestMode = 'restart'; $script:targetWaitFails = $false
+    $script:targetBirth = [DateTime]::UtcNow
+    function Get-CimInstance {
+        param([string]$ClassName, [string]$Filter)
+        $script:targetQueryCount++
+        if ($script:targetTestMode -eq 'stale' -and $script:targetQueryCount -gt 1) { return }
+        foreach ($processId in @(301, 302, 303, 304)) {
+            if ($script:targetTestMode -eq 'stale' -and $processId -gt 302) { continue }
+            if ($processId -gt 302 -and -not $script:targetHandles[302].HasExited) { continue }
+            if (-not $script:targetHandles[$processId].HasExited) {
+                [pscustomobject]@{ ProcessId = $processId; CreationDate = $script:targetBirth; ExecutablePath = $TargetExecutable }
+            }
+        }
+        [pscustomobject]@{ ProcessId = 999; CreationDate = $script:targetBirth; ExecutablePath = 'OTHER_DIRECTORY/ai-canvas.exe' }
+    }
+    function Get-Process {
+        param([int]$Id, [string]$ErrorAction)
+        return $script:targetHandles[$Id]
+    }
+    function Stop-Process { throw 'CHECK:target-fixture-must-use-verified-owned-handle' }
+    foreach ($processId in @(301, 302, 303, 304)) {
+        $handle = [pscustomobject]@{ Id = $processId; Handle = [IntPtr]$processId; HasExited = $false; StartTime = $script:targetBirth; MainModule = [pscustomobject]@{ FileName = $TargetExecutable } }
+        $handle | Add-Member ScriptMethod Kill { $script:targetEvents.Add('kill-' + $this.Id) | Out-Null }
+        $handle | Add-Member ScriptMethod WaitForExit { param($timeout) $script:targetEvents.Add('wait-' + $this.Id) | Out-Null; if ($script:targetWaitFails) { return $false }; $this.HasExited = $true; return $true }
+        $handle | Add-Member ScriptMethod Refresh { }
+        $handle | Add-Member ScriptMethod Dispose { $script:targetEvents.Add('dispose-' + $this.Id) | Out-Null }
+        $script:targetHandles[$processId] = $handle
+    }
+    Stop-TargetProcesses
+    Check (@($targetEvents | Where-Object { $_ -like 'wait-*' }).Count -eq 4 -and $targetQueryCount -ge 4) 'target cleanup waits for every Electron process and rechecks restarted descendants until empty'
+    Check ($targetEvents.IndexOf('wait-302') -lt $targetEvents.IndexOf('kill-303') -and @($targetEvents | Where-Object { $_ -like '*999' }).Count -eq 0) 'target cleanup settles a new generation while preserving other install paths'
+    $script:targetEvents.Clear(); $script:targetQueryCount = 0; $script:targetTestMode = 'stale'
+    $script:targetHandles[301].HasExited = $false; $script:targetHandles[302].HasExited = $false
+    $script:targetHandles[301].MainModule.FileName = 'REUSED_IMAGE.exe'
+    $script:targetHandles[302].StartTime = $script:targetBirth.AddSeconds(2)
+    $SuspendedIds.Add(301) | Out-Null
+    Stop-TargetProcesses
+    Check (@($targetEvents | Where-Object { $_ -like 'kill-*' }).Count -eq 0 -and $SuspendedIds.Contains(301)) 'target cleanup rechecks image and birth time before killing or resuming stale PIDs'
+    $script:targetHandles[301].MainModule.FileName = $TargetExecutable
+    $script:targetHandles[302].HasExited = $true
+    $script:targetQueryCount = 0; $script:targetWaitFails = $true; $SuspendedIds.Clear()
+    $failure = ''
+    try { Stop-TargetProcesses 500 } catch { $failure = $_.Exception.Message }
+    Check ($failure -ceq 'ASSERT:target-process-cleanup-exit-timeout' -and $targetEvents.Contains('dispose-301')) 'target wait failure fails cleanup and still releases its owned handle'
+}
+if (-not ('NativeInstallerProbe' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+public static class NativeInstallerProbe {
+    public static bool State, Posted=true, Pending, ReadFails;
+    public static int Reads, Clicks, ReadDelay, PendingReads;
+    public static Dictionary<long,long> Parents=new Dictionary<long,long>();
+    public static bool Checked(IntPtr h) {
+        Reads++;
+        if(ReadFails)throw new InvalidOperationException("synthetic-state-read-failed");
+        if(Pending && PendingReads--<=0){State=!State;Pending=false;}
+        return State;
+    }
+    public static bool Click(IntPtr h) { Clicks++;Pending=Posted;PendingReads=ReadDelay;return Posted; }
+    public static bool IsChild(IntPtr parent, IntPtr child) { return Parents.ContainsKey(child.ToInt64()) && Parents[child.ToInt64()]==parent.ToInt64(); }
+    public static int Resume(int pid) { return 0; }
+}
+'@
+}
+$box = [pscustomobject]@{ Id = 1203; Handle = [IntPtr]1203 }
+foreach ($desired in @($false, $true)) {
+    $script:LastRunCheckboxEvidence = New-Object Collections.ArrayList
+    [NativeInstallerProbe]::State = -not $desired; [NativeInstallerProbe]::Pending = $false; [NativeInstallerProbe]::Posted = $true
+    [NativeInstallerProbe]::Reads = 0; [NativeInstallerProbe]::Clicks = 0; [NativeInstallerProbe]::ReadDelay = 2
+    Confirm-InstallerRunCheckbox $box $desired 500
+    $savedBox = $LastRunCheckboxEvidence[0]
+    Check ($savedBox.checkedBefore -eq (-not $desired) -and $savedBox.checkedAfter -eq $desired -and $savedBox.confirmed -and $savedBox.clickPosted -and [NativeInstallerProbe]::Reads -ge 4) ('run checkbox waits for asynchronous state confirmation: ' + $desired)
+}
+$script:LastRunCheckboxEvidence = New-Object Collections.ArrayList
+[NativeInstallerProbe]::State = $false; [NativeInstallerProbe]::Pending = $false; [NativeInstallerProbe]::Clicks = 0
+Confirm-InstallerRunCheckbox $box $false
+Check ([NativeInstallerProbe]::Clicks -eq 0 -and $null -eq $LastRunCheckboxEvidence[0].clickPosted -and $LastRunCheckboxEvidence[0].confirmed) 'already-correct run checkbox is confirmed without toggling'
+$ok = Invoke-Case 'rejected-checkbox-post' {
+    $script:LastUiEvidence = @([ordered]@{ dialogText = 'sanitized-first-dialog' })
+    $script:LastRunCheckboxEvidence = New-Object Collections.ArrayList
+    [NativeInstallerProbe]::State = $true; [NativeInstallerProbe]::Posted = $false
+    Confirm-InstallerRunCheckbox $box $false
+    throw 'ASSERT:finish-must-not-run'
+} 6>$null
+$failedBoxCase = $Cases[-1]
+$script:LastUiEvidence = @([ordered]@{ dialogText = 'later-dialog' })
+Check (-not $ok -and $failedBoxCase.failureCode -ceq 'installer-run-checkbox-click-failed' -and -not $failedBoxCase.runCheckboxEvidence[0].confirmed) 'failed checkbox post blocks Finish and remains visible in its case'
+Check ($failedBoxCase.uiEvidence[0].dialogText -ceq 'sanitized-first-dialog') 'case keeps its safe UI snapshot after later windows replace global evidence'
+$ok = Invoke-Case 'failure-before-observing-ui' { throw 'ASSERT:pre-ui-failure' } 6>$null
+Check (-not $ok -and $null -eq $Cases[-1].PSObject.Properties['uiEvidence']) 'failure before observing UI cannot inherit the previous case modal'
+$ok = Invoke-Case 'unconfirmed-checkbox-state' {
+    $script:LastRunCheckboxEvidence = New-Object Collections.ArrayList
+    [NativeInstallerProbe]::State = $true; [NativeInstallerProbe]::Posted = $true; [NativeInstallerProbe]::Pending = $false; [NativeInstallerProbe]::ReadDelay = [int]::MaxValue
+    Confirm-InstallerRunCheckbox $box $false 1
+    throw 'ASSERT:finish-must-not-run'
+} 6>$null
+Check (-not $ok -and $Cases[-1].failureCode -ceq 'installer-run-checkbox-state-not-confirmed' -and $Cases[-1].runCheckboxEvidence[0].checkedAfter) 'unchanged asynchronous checkbox state fails before Finish'
+$ok = Invoke-Case 'unreadable-checkbox-state' {
+    $script:LastRunCheckboxEvidence = New-Object Collections.ArrayList
+    [NativeInstallerProbe]::ReadFails = $true
+    Confirm-InstallerRunCheckbox $box $false 1
+    throw 'ASSERT:finish-must-not-run'
+} 6>$null
+[NativeInstallerProbe]::ReadFails = $false; [NativeInstallerProbe]::Pending = $false
+Check (-not $ok -and -not $Cases[-1].runCheckboxEvidence[0].confirmed -and $null -eq $Cases[-1].runCheckboxEvidence[0].checkedBefore) 'unreadable checkbox state cannot be mistaken for unchecked'
+$labelAssignment = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$Labels' }, $true)
+$Labels = & ([scriptblock]::Create($labelAssignment.Right.Extent.Text))
+$InstallDirectory = 'TEST_INSTALL'; $UserDataDirectory = 'USERDATA'; $TestRoot = 'FIXTURE_ROOT'
+function New-ProbeWindow([int]$Handle, [int]$Id, [string]$Class, [string]$Text, [bool]$TopLevel, [bool]$Enabled, [int]$Parent = 0) {
+    if ($Parent -ne 0) { [NativeInstallerProbe]::Parents[[long]$Handle] = [long]$Parent }
+    return [pscustomobject]@{ Handle = [IntPtr]$Handle; Id = $Id; ClassName = $Class; Text = $Text; TopLevel = $TopLevel; Enabled = $Enabled; OwnerPid = 77; X = 0; Y = 0; Width = 100; Height = 100; ToolWindow = $false; ExtendedStyle = 0 }
+}
+function New-DialogFixture([string]$Body, [int[]]$Ids, [string]$Kind = '') {
+    New-ProbeWindow 10 0 '#32770' 'Wizard' $true $false
+    New-ProbeWindow 20 0 '#32770' 'Process dialog' $true $true
+    New-ProbeWindow 2001 65535 'Static' $Body $false $true 20
+    foreach ($id in $Ids) {
+        $caption = switch ($id) { 1 { 'OK' }; 2 { 'Cancel' }; 6 { 'Yes' }; 7 { 'No' }; 4 { if ($Kind -eq 'force') { $Labels.retry } else { $Labels.normal } } }
+        if ($Kind -ne '' -and $id -eq 6) { $caption = $Labels.force }
+        if ($Kind -ne '' -and $id -eq 2) { $caption = $Labels.cancel }
+        New-ProbeWindow (2010 + $id) $id 'Button' $caption $false $true 20
+    }
+}
+$normalBody = [regex]::Unescape('\u8f6f\u4ef6\u6b63\u5728\u8fd0\u884c\uff0c\u8bf7\u5148\u5173\u95ed\u8f6f\u4ef6\u540e\u7ee7\u7eed\u3002\r\n\r\n\u786e\u5b9a\uff1a\u5173\u95ed\u8f6f\u4ef6\u5e76\u7ee7\u7eed\r\n\u53d6\u6d88\uff1a\u53d6\u6d88\u5b89\u88c5')
+$forceBody = [regex]::Unescape('\u8f6f\u4ef6\u4ecd\u5728\u8fd0\u884c\u3002\u5f3a\u5236\u5173\u95ed\u53ef\u80fd\u4e22\u5931\u672a\u4fdd\u5b58\u7684\u5185\u5bb9\uff0c\u5e76\u4e2d\u65ad\u6b63\u5728\u8fdb\u884c\u7684\u4efb\u52a1\u3002\r\n\r\n\u662f\uff1a\u5f3a\u5236\u5173\u95ed\u5e76\u5347\u7ea7\r\n\u5426\uff1a\u91cd\u8bd5\u6b63\u5e38\u5173\u95ed\r\n\u53d6\u6d88\uff1a\u53d6\u6d88\u5b89\u88c5')
+foreach ($body in @($normalBody, $normalBody.Replace("`r`n", "`n"))) {
+    $windows = @(New-DialogFixture $body @(1, 2))
+    $dialog = Get-ProcessDialogButtons $windows
+    $ui = @(Get-UiEvidence $windows)
+    Check ((Get-InstallerPageStage $windows) -ceq 'normal-close-prompt' -and $dialog.normal[0].Id -eq 1 -and $dialog.cancel[0].Id -eq 2 -and @($ui | Where-Object { $_.Contains('dialogText') -and -not $_.Contains('processDialogKind') }).Count -eq 0) 'exact normal MessageBox fallback maps OK to normal close for CRLF or LF'
+}
+$windows = @(New-DialogFixture $forceBody @(6, 7, 2))
+$dialog = Get-ProcessDialogButtons $windows
+Check ((Get-InstallerPageStage $windows) -ceq 'force-warning' -and $dialog.force[0].Id -eq 6 -and $dialog.retry[0].Id -eq 7 -and $dialog.cancel[0].Id -eq 2 -and (Test-VisibleLossWarning $windows)) 'exact force MessageBox fallback preserves loss warning and force/retry/cancel semantics'
+foreach ($kind in @('normal', 'force')) {
+    $ids = if ($kind -eq 'normal') { @(4, 2) } else { @(4, 6, 2) }
+    $windows = @(New-DialogFixture 'TaskDialog body without an OK error button' $ids $kind)
+    $dialog = Get-ProcessDialogButtons $windows
+    $valid = if ($kind -eq 'normal') { $dialog.normal[0].Id -eq 4 } else { $dialog.force[0].Id -eq 6 -and $dialog.retry[0].Id -eq 4 }
+    Check ($valid -and $null -eq (Get-ExpectedProcessFallback $windows)) ('custom TaskDialog action mapping remains unchanged: ' + $kind)
+}
+foreach ($item in @(
+    @{ body = $normalBody + ' unexpected suffix'; ids = @(1, 2) },
+    @{ body = 'Unknown asset error'; ids = @(1) },
+    @{ body = $normalBody; ids = @(1, 2, 3) },
+    @{ body = $normalBody; ids = @(1) }
+)) {
+    $windows = @(New-DialogFixture $item.body $item.ids)
+    $ui = @(Get-UiEvidence $windows)
+    Check ($null -eq (Get-ExpectedProcessFallback $windows) -and @($ui | Where-Object { $_.Contains('dialogText') -and -not $_.Contains('processDialogKind') }).Count -gt 0) 'unknown or malformed OK modal remains fatal instead of receiving blanket permission'
+}
+$windows = @(New-DialogFixture $normalBody @(1, 2))
+[NativeInstallerProbe]::Parents[[long]2012] = 99
+Check ($null -eq (Get-ExpectedProcessFallback $windows)) 'fallback buttons must belong to the same exact modal'
+foreach ($item in @(
+    @{ body = $normalBody; ids = @(1, 2, 6) },
+    @{ body = $forceBody; ids = @(6, 4, 2) },
+    @{ body = $forceBody.Replace($Labels.warning, ''); ids = @(6, 7, 2) }
+)) {
+    $windows = @(New-DialogFixture $item.body $item.ids)
+    Check ($null -eq (Get-ExpectedProcessFallback $windows)) 'fallback requires its full loss warning and exact production button ID set'
+}
+$windows = @(New-DialogFixture $normalBody @(1, 2))
+$windows += New-ProbeWindow 30 0 '#32770' 'Unknown error' $true $true
+$windows += New-ProbeWindow 3001 65535 'Static' 'Unknown asset error' $false $true 30
+$windows += New-ProbeWindow 3011 1 'Button' 'OK' $false $true 30
+$ui = @(Get-UiEvidence $windows)
+Check (@($ui | Where-Object { $_.Contains('processDialogKind') }).Count -eq 1 -and @($ui | Where-Object { $_.Contains('dialogText') -and -not $_.Contains('processDialogKind') }).Count -eq 1) 'known fallback cannot hide a separate unknown error modal'
 function Stop-TargetProcesses { throw 'ASSERT:simulated-cim-cleanup-failure' }
 $topTry = $ast.Find({ param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $null -ne $n.Finally -and $n.Finally.Extent.Text.Contains('$Report.completedAt') }, $true)
 $cleanupText = $topTry.Finally.Extent.Text
@@ -229,6 +424,7 @@ try {
         $saved = Get-Content -LiteralPath (Join-Path $OutputDirectory 'report.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         Check ($saved.status -ceq 'failed' -and (Test-Path -LiteralPath (Join-Path $OutputDirectory 'report.txt'))) 'cleanup exception still writes failed JSON and text reports'
         Check ([string]$saved.failureCode -ceq [string]$Failure -and @($saved.cleanupFailures | Where-Object { $_.stage -ceq 'target-processes' -and $_.code -ceq 'simulated-cim-cleanup-failure' }).Count -eq 1) 'top cleanup records safe stage failure and preserves original failure'
+        Check (-not $saved.lastInstallerExitEvidence.hasExited -and -not $saved.lastInstallerExitEvidence.exitCodePresent -and $null -eq $saved.lastInstallerExitEvidence.exitCode) 'final report preserves missing exit code without coercing it to zero'
     }
 } finally { if (Test-Path -LiteralPath $OutputDirectory) { Remove-Item -LiteralPath $OutputDirectory -Recurse -Force } }
 Write-Output 'No native Windows execution claimed.'
