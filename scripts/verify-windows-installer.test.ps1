@@ -5,7 +5,7 @@ $driver = Join-Path $PSScriptRoot 'verify-windows-installer.ps1'
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($driver, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw 'driver-parse-error' }
-foreach ($name in @('Assert-True', 'Write-Json', 'Get-SafeFailureEvidence', 'Invoke-FixtureCase', 'Invoke-Case', 'Test-OwnedInstallerIdentity', 'Test-OwnedInstallerParent', 'Stop-OwnedInstallerProcesses', 'Get-InstallerProcesses', 'Invoke-HarnessCleanup')) {
+foreach ($name in @('Assert-True', 'Write-Json', 'Get-Payload', 'Get-SafeFailureEvidence', 'Invoke-FixtureCase', 'Invoke-Case', 'Test-OwnedInstallerIdentity', 'Test-OwnedInstallerParent', 'Stop-OwnedInstallerProcesses', 'Get-InstallerProcesses', 'Invoke-HarnessCleanup')) {
     $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -184,6 +184,30 @@ $ids = New-Object 'Collections.Generic.HashSet[int]'; $ids.Add(100) | Out-Null; 
 $script:processRecords = @{ 105 = [pscustomobject]@{ ProcessId = 105; ParentProcessId = 100; CreationDate = $identityStart.AddMilliseconds(500); ExecutablePath = 'KNOWN_ORPHAN.exe' } }
 $observed = @(Get-InstallerProcesses $ids)
 Check ($observed.Count -eq 1 -and $observed[0].ProcessId -eq 105) 'already-owned child remains tracked after parent disappears'
+$getHashFunction = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-Hash' }, $true)
+. ([scriptblock]::Create($getHashFunction.Extent.Text))
+$payloadFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('aiwork-payload-identity-check-' + [Guid]::NewGuid().ToString('N'))
+$payloadFixtureDirectory = Join-Path $payloadFixtureRoot 'payload'
+[IO.Directory]::CreateDirectory($payloadFixtureDirectory) | Out-Null
+$payloadFixtureFile = Join-Path $payloadFixtureDirectory 'fixture-setup.exe'
+[IO.File]::WriteAllBytes($payloadFixtureFile, [byte[]]@(77, 90, 1, 2, 3))
+$payloadPin = (Get-FileHash -LiteralPath $payloadFixtureFile -Algorithm SHA256).Hash.ToLowerInvariant()
+Push-Location $payloadFixtureRoot
+try {
+    $PayloadDirectory = './payload'
+    $payload = Get-Payload ([pscustomobject]@{ file = 'fixture-setup.exe'; sha256 = $payloadPin; version = '0.7.0' })
+    $absoluteImage = (Resolve-Path -LiteralPath $payloadFixtureFile).ProviderPath
+    Check ([IO.Path]::IsPathRooted($payload.path) -and $payload.path -ceq $absoluteImage) 'relative payload input resolves against the PowerShell location'
+    $LastInstallerInvocationStartedAt = $identityStart
+    $OwnedInstallerIdentities = @{ 200 = @{ startedAtFileTime = $identityStart.ToFileTimeUtc(); executablePath = $payload.path } }
+    $ids = New-Object 'Collections.Generic.HashSet[int]'; $ids.Add(200) | Out-Null
+    $script:processRecords = @{ 200 = [pscustomobject]@{ ProcessId = 200; ParentProcessId = 0; CreationDate = $identityStart; ExecutablePath = $absoluteImage } }
+    $observed = @(Get-InstallerProcesses $ids)
+    Check ($observed.Count -eq 1 -and $observed[0].ProcessId -eq 200 -and (Test-OwnedInstallerIdentity $processRecords[200])) 'resolved payload root matches absolute CIM image without relaxing identity checks'
+} finally {
+    Pop-Location
+    Remove-Item -LiteralPath $payloadFixtureRoot -Recurse -Force
+}
 if (-not ('NativeInstallerProbe' -as [type])) { Add-Type -TypeDefinition 'public static class NativeInstallerProbe { public static int Resume(int pid) { return 0; } }' }
 function Stop-TargetProcesses { throw 'ASSERT:simulated-cim-cleanup-failure' }
 $topTry = $ast.Find({ param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $null -ne $n.Finally -and $n.Finally.Extent.Text.Contains('$Report.completedAt') }, $true)

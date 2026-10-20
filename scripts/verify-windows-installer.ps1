@@ -88,7 +88,7 @@ function Get-Payload([object]$Item) {
     Assert-True ([IO.Path]::GetFileName([string]$Item.file) -eq [string]$Item.file) 'manifest-file-must-be-basename'
     Assert-True ([string]$Item.sha256 -match '^[a-fA-F0-9]{64}$') 'manifest-invalid-hash'
     Assert-True ([string]$Item.version -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') 'manifest-invalid-version'
-    $path = Join-Path $PayloadDirectory ([string]$Item.file)
+    $path = (Resolve-Path -LiteralPath (Join-Path $PayloadDirectory ([string]$Item.file))).ProviderPath
     $hash = Get-Hash $path
     Assert-True ($hash -eq ([string]$Item.sha256).ToLowerInvariant()) 'payload-hash-mismatch'
     $result = [ordered]@{ path = $path; sha256 = $hash; version = [string]$Item.version }
@@ -496,6 +496,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
         throw 'ASSERT:installer-timeout'
     }
     $process.Refresh()
+    Assert-True $process.HasExited 'installer-tracking-ended-before-process-exit'
     Assert-True (-not $replacementWhileFixtureAlive) 'replacement-before-fixture-exit'
     if ($Scenario -eq 'replacement-lock') {
         Assert-True ($forceCount -eq 0) 'lock-case-must-not-force'
