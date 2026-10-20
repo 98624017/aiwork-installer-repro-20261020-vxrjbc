@@ -2,6 +2,23 @@ name: Diagnose native Windows installer crash
 
 on:
   workflow_dispatch:
+    inputs:
+      modes:
+        description: JSON array of isolated diagnostic modes
+        type: string
+        default: '["direct","original-name","current-user","all-users","compat-invoker","debugger"]'
+      installerRelease:
+        description: Release tag containing the installer to test
+        type: string
+        default: candidate
+      installerAsset:
+        description: Setup asset name in the selected release
+        type: string
+        default: candidate-setup.exe
+      installerSha256:
+        description: Expected SHA256 of the selected Setup
+        type: string
+        default: 3a6860d8d546055393c451f487f6240c5570f982b5038370978efc82cda8d091
 
 permissions:
   contents: read
@@ -11,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [direct, original-name, current-user, all-users, compat-invoker, debugger]
+        mode: ${{ fromJSON(inputs.modes) }}
     runs-on: windows-2025
     timeout-minutes: 12
     steps:
@@ -35,15 +52,18 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          INSTALLER_RELEASE: ${{ inputs.installerRelease }}
+          INSTALLER_ASSET: ${{ inputs.installerAsset }}
+          INSTALLER_SHA256: ${{ inputs.installerSha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
-          gh release download candidate --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern candidate-setup.exe --dir payload
+          gh release download $env:INSTALLER_RELEASE --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern $env:INSTALLER_ASSET --dir payload
           if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
-          $installerPath = (Resolve-Path -LiteralPath 'payload/candidate-setup.exe').Path
-          if ((Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne '3a6860d8d546055393c451f487f6240c5570f982b5038370978efc82cda8d091') { throw 'Candidate hash mismatch' }
+          $installerPath = (Resolve-Path -LiteralPath (Join-Path 'payload' $env:INSTALLER_ASSET)).Path
+          if ((Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:INSTALLER_SHA256.ToLowerInvariant()) { throw 'Candidate hash mismatch' }
           "INSTALLER_PATH=$installerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Install Microsoft native debugging tools
-        if: matrix.mode == 'debugger'
+        if: matrix.mode == 'debugger' || matrix.mode == 'wer'
         timeout-minutes: 5
         shell: pwsh
         run: |
@@ -69,7 +89,12 @@ jobs:
         run: |
           $parameters = @{ Mode = $env:DIAGNOSTIC_MODE; InstallerPath = $env:INSTALLER_PATH; OutputDirectory = './diagnostics' }
           if ($env:DEBUGGER_PATH) { $parameters.DebuggerPath = $env:DEBUGGER_PATH }
-          & ./scripts/debug-installer.ps1 @parameters
+          if ($env:DIAGNOSTIC_MODE -eq 'wer') {
+            $parameters.Remove('Mode')
+            & ./scripts/capture-installer-crash.ps1 @parameters
+          } else {
+            & ./scripts/debug-installer.ps1 @parameters
+          }
       - name: Upload diagnostic evidence without dumps
         if: always()
         uses: actions/upload-artifact@v7
