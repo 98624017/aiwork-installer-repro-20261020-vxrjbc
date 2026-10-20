@@ -203,11 +203,33 @@ function Get-UiLabel([string]$Text) {
     return 'other'
 }
 
+function Get-SafeDialogText([string]$Text) {
+    $safe = $Text
+    foreach ($path in @($InstallDirectory, $UserDataDirectory, $TestRoot, $env:USERPROFILE, $env:RUNNER_TEMP)) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $safe = $safe.Replace($path, '<FIXTURE_PATH>') }
+    }
+    $safe = $safe -replace '(?i)[a-z][a-z0-9+.-]*://[^\s]+', '<URL>'
+    $safe = $safe -replace '(?i)(bearer\s+|(?:token|api.?key|password|secret)\s*[:=]\s*)[^\s,;]+', '$1<REDACTED>'
+    $safe = $safe -replace '[A-Za-z0-9_+/=-]{32,}', '<REDACTED>'
+    return $safe.Substring(0, [Math]::Min(512, $safe.Length))
+}
+
 function Get-UiEvidence([object[]]$Windows) {
+    $modals = @($Windows | Where-Object { $_.TopLevel -and $_.Enabled -and $_.ClassName -eq '#32770' })
     return @($Windows | ForEach-Object {
+        $window = $_
         $item = [ordered]@{ ownerPid = $_.OwnerPid; id = $_.Id; class = $_.ClassName; label = Get-UiLabel $_.Text; enabled = $_.Enabled; topLevel = $_.TopLevel; x = $_.X; y = $_.Y; width = $_.Width; height = $_.Height; toolWindow = $_.ToolWindow; extendedStyle = $_.ExtendedStyle }
         if ($_.ClassName -eq 'Button' -or $_.ClassName.StartsWith('WindowsForms10.BUTTON', [StringComparison]::OrdinalIgnoreCase)) {
             $item.buttonText = $_.Text.Substring(0, [Math]::Min(128, $_.Text.Length))
+        }
+        if ($window.ClassName -eq 'Static' -and -not [string]::IsNullOrWhiteSpace($window.Text)) {
+            foreach ($modal in $modals) {
+                $blockedWizard = @($Windows | Where-Object { $_.OwnerPid -eq $modal.OwnerPid -and $_.TopLevel -and -not $_.Enabled -and $_.ClassName -eq '#32770' })
+                $ok = @($Windows | Where-Object { $_.ClassName -eq 'Button' -and $_.Enabled -and $_.Text.Replace('&', '').Trim() -match $Labels.okPattern -and [NativeInstallerProbe]::IsChild($modal.Handle, $_.Handle) })
+                if ($blockedWizard.Count -gt 0 -and $ok.Count -gt 0 -and [NativeInstallerProbe]::IsChild($modal.Handle, $window.Handle)) {
+                    $item.dialogText = Get-SafeDialogText $window.Text
+                }
+            }
         }
         $item
     })
@@ -275,7 +297,12 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
         $live = @(Get-InstallerProcesses $ids)
         Read-PackagedHelperEvidence $live $Package
         $lastUi = @([NativeInstallerProbe]::Windows([int[]]@($live | ForEach-Object { [int]$_.ProcessId })))
-        if ($lastUi.Count -gt 0) { $script:LastUiEvidence = Get-UiEvidence $lastUi }
+        if ($lastUi.Count -gt 0) {
+            $script:LastUiEvidence = Get-UiEvidence $lastUi
+            if ($Scenario -ne 'replacement-lock' -and @($script:LastUiEvidence | Where-Object { $_.Contains('dialogText') }).Count -gt 0) {
+                throw 'ASSERT:unexpected-installer-modal'
+            }
+        }
         $stage = Get-InstallerPageStage $lastUi
         if ($stage -ne $lastStage) {
             Add-InstallerTrace $trace $timer $stage 'page-observed' 'enumeration' 0 $true
@@ -650,6 +677,7 @@ public static class NativeInstallerProbe {
     [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr h, EnumProc fn, IntPtr p);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent, IntPtr child);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint id);
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr h);
     [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr h);

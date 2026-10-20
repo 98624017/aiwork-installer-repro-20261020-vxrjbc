@@ -4,6 +4,7 @@ param([ValidateSet('direct', 'current-user', 'all-users')][string]$Mode)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 . (Join-Path $PSScriptRoot 'shortcut-probe.ps1')
+. (Join-Path $PSScriptRoot 'lifecycle-probe.ps1')
 $utf8 = [Text.UTF8Encoding]::new($false)
 $output = Join-Path $PWD 'lifecycle-evidence'
 New-Item -ItemType Directory -Path $output | Out-Null
@@ -31,19 +32,47 @@ function Test-Payload([string]$Target) {
 }
 
 function Invoke-SettledInstaller([string]$File, [string]$Arguments) {
+    $startedAt = [DateTime]::UtcNow
     $child = Start-Process -FilePath $File -ArgumentList $Arguments -PassThru
+    $ids = New-Object 'Collections.Generic.HashSet[int]'
+    $ids.Add($child.Id) | Out-Null
+    $observed = @{}
+    $trace = New-Object Collections.ArrayList
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $lastLive = ''
     try {
-        if (-not $child.WaitForExit(180000)) {
-            $report.timeoutWindow = [string]$child.MainWindowTitle
-            Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-            $window = [System.Windows.Automation.AutomationElement]::FromHandle($child.MainWindowHandle)
-            if ($null -ne $window) {
-                $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-                $report.timeoutControls = @(foreach ($element in $elements) {
-                    if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -or $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) {
-                        [ordered]@{ type = $element.Current.ControlType.ProgrammaticName; text = $element.Current.Name }
+        while ($timer.ElapsedMilliseconds -lt 180000) {
+            $live = @(Get-LifecycleOwnedProcesses $ids $startedAt @(Get-CimInstance Win32_Process) $File)
+            foreach ($item in $live) {
+                if (-not $observed.ContainsKey([int]$item.ProcessId)) {
+                    $observed[[int]$item.ProcessId] = Get-LifecycleProcessEvidence $item $child.Id
+                }
+            }
+            $liveKey = (@($live | ForEach-Object { [int]$_.ProcessId } | Sort-Object) -join ',')
+            if ($liveKey -cne $lastLive) {
+                $trace.Add([ordered]@{ elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2); livePids = @($live | ForEach-Object { [int]$_.ProcessId }) }) | Out-Null
+                if ($trace.Count -gt 120) { $trace.RemoveAt(0) }
+                $lastLive = $liveKey
+            }
+            if ($child.WaitForExit(1000)) { break }
+        }
+        if (-not $child.HasExited) {
+            $fixturePaths = @($File, $target, $env:RUNNER_TEMP, $env:TEMP, $env:USERPROFILE)
+            $report.timeoutWindow = Protect-LifecycleText ([string]$child.MainWindowTitle) $fixturePaths
+            $report.timeoutProcesses = @($observed.Values | Sort-Object { $_.pid })
+            $report.timeoutProcessTrace = @($trace)
+            try {
+                $live = @(Get-LifecycleOwnedProcesses $ids $startedAt @(Get-CimInstance Win32_Process) $File)
+                $report.timeoutLivePids = @($live | ForEach-Object { [int]$_.ProcessId })
+                foreach ($item in $live) {
+                    if (-not $observed.ContainsKey([int]$item.ProcessId)) {
+                        $observed[[int]$item.ProcessId] = Get-LifecycleProcessEvidence $item $child.Id
                     }
-                })
+                }
+                $report.timeoutProcesses = @($observed.Values | Sort-Object { $_.pid })
+                $report.timeoutControls = @(Get-LifecycleWindowEvidence $report.timeoutLivePids $fixturePaths)
+            } catch {
+                $report.timeoutDiagnosticsError = $_.Exception.GetType().Name
             }
             $child.Kill()
             throw 'installer-process-timeout'
