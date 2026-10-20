@@ -72,7 +72,7 @@ function Get-InstallationEvidence {
 
 try {
     if (-not $env:RUNNER_TEMP) { throw 'runner-temp-required' }
-    if (-not $IsWindows) { throw 'windows-required' }
+    if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'windows-required' }
     $InstallerPath = (Resolve-Path -LiteralPath $InstallerPath).ProviderPath
     $sourceHash = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $inputDirectory = Join-Path $env:RUNNER_TEMP 'diag-input'
