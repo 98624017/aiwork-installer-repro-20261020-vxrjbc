@@ -9,10 +9,10 @@
   },
   "candidate": {
     "file": "branding-setup.exe",
-    "sha256": "dcbd5f3ace2862d519579ea15baf77687762143ee71a96f89908e95b3f1aecbc",
+    "sha256": "b8628aaace36d2de32e913b7732884d530ecba768f151e6d4e2bb70c1fa98d6a",
     "version": "0.7.0",
-    "exeSha256": "061299b541442d89299df51bc7ee6514545c465a728461cc0697436fbbfb815d",
-    "asarSha256": "a7424b83d597d3cd124075adcb4fa636648380069f4d12826366174d5f70c491",
+    "exeSha256": "74344901085bde1210aaecdf1efc78a3dfa6763f20ab33eeb7cf4d2d82e525d6",
+    "asarSha256": "5763f0f2ce7cf217feecc5620f0df8d11f0991816ddea16ec4dfcc0949c6ef49",
     "helperSha256": "83e0a240911e3183d4f1bf7dd88cfc0620d6d3a276d515b2b64ae5aa3328233b"
   },
   "baseline": {

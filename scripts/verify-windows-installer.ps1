@@ -15,6 +15,9 @@ $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $StartedAt = [DateTime]::UtcNow
 $Cases = New-Object System.Collections.ArrayList
 $OwnedInstallerIds = New-Object 'System.Collections.Generic.HashSet[int]'
+$OwnedInstallerIdentities = @{}
+$LastInstallerInvocationIds = $null
+$LastInstallerInvocationStartedAt = [DateTime]::MinValue
 $SuspendedIds = New-Object 'System.Collections.Generic.HashSet[int]'
 $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('aiwork-installer-validation-' + [Guid]::NewGuid().ToString('N'))
 $InstallDirectory = Join-Path (Join-Path $TestRoot ('Install with spaces ' + [char]0x6D4B + [char]0x8BD5)) 'ai-canvas'
@@ -31,6 +34,8 @@ $OriginalAppId = $null
 $SwitchChannel = $null
 $SwitchPreviousShortcutName = ''
 $FixtureProcess = $null
+$FixtureRecoveryFailed = $false
+$LastFixtureCaseEvidence = $null
 $OtherProcess = $null
 $BackupExecutable = Join-Path $TestRoot 'protected-app-backup.exe'
 $ExpectedCaseCount = if ($BrandingOnly) { if ($FreshCandidate) { 4 } else { 5 } } else { 18 }
@@ -120,6 +125,87 @@ function Stop-TargetProcesses {
     }
 }
 
+function Get-SafeFailureEvidence([Management.Automation.ErrorRecord]$ErrorRecord) {
+    return [ordered]@{
+        code = if ($ErrorRecord.Exception.Message -match '^ASSERT:([a-z0-9-]+)$') { $Matches[1] } else { 'unexpected-' + $ErrorRecord.Exception.GetType().Name }
+        line = $ErrorRecord.InvocationInfo.ScriptLineNumber
+        exceptionType = $ErrorRecord.Exception.GetType().FullName
+        hresult = '0x{0:X8}' -f $ErrorRecord.Exception.HResult
+        errorCategory = [string]$ErrorRecord.CategoryInfo.Category
+    }
+}
+
+function Test-OwnedInstallerIdentity([object]$Process) {
+    $key = [int]$Process.ProcessId
+    if (-not $OwnedInstallerIdentities.ContainsKey($key)) { return $false }
+    $identity = $OwnedInstallerIdentities[$key]
+    return $null -ne $Process.CreationDate -and
+        [Math]::Abs($Process.CreationDate.ToUniversalTime().ToFileTimeUtc() - $identity.startedAtFileTime) -le 10000 -and
+        [string]::Equals([string]$Process.ExecutablePath, $identity.executablePath, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-OwnedInstallerParent([object]$Child, [hashtable]$Snapshot) {
+    $parentId = [int]$Child.ParentProcessId
+    if (-not $OwnedInstallerIdentities.ContainsKey($parentId)) { return $false }
+    $identity = $OwnedInstallerIdentities[$parentId]
+    $childStartedAt = $Child.CreationDate.ToUniversalTime().ToFileTimeUtc()
+    if ($childStartedAt -lt $identity.startedAtFileTime) { return $false }
+    if ($identity.ContainsKey('processHandle')) {
+        # The original handle can prove an NSIS child predates a parent's exit and PID reuse.
+        try {
+            $handle = $identity.processHandle
+            if ([Math]::Abs($handle.StartTime.ToUniversalTime().ToFileTimeUtc() - $identity.startedAtFileTime) -gt 10000) { return $false }
+            return -not $handle.HasExited -or $childStartedAt -le $handle.ExitTime.ToUniversalTime().ToFileTimeUtc()
+        }
+        catch { return $false }
+    }
+    return $Snapshot.ContainsKey($parentId) -and (Test-OwnedInstallerIdentity $Snapshot[$parentId])
+}
+
+function Stop-OwnedInstallerProcesses([Collections.Generic.HashSet[int]]$Ids) {
+    foreach ($processId in @($Ids)) {
+        $current = @(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $processId) -ErrorAction SilentlyContinue)
+        foreach ($item in $current) {
+            if (-not (Test-OwnedInstallerIdentity $item)) { continue }
+            $handle = Get-Process -Id $processId -ErrorAction SilentlyContinue
+            if ($null -eq $handle) { continue }
+            try {
+                $null = $handle.Handle
+                $identity = $OwnedInstallerIdentities[[int]$processId]
+                if ([Math]::Abs($handle.StartTime.ToUniversalTime().ToFileTimeUtc() - $identity.startedAtFileTime) -gt 10000 -or
+                    -not [string]::Equals([string]$handle.MainModule.FileName, $identity.executablePath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $handle.Kill()
+                Assert-True ($handle.WaitForExit(5000)) 'owned-installer-cleanup-timeout'
+            }
+            catch {
+                $handle.Refresh()
+                if (-not $handle.HasExited) { throw }
+            }
+            finally { $handle.Dispose() }
+        }
+    }
+}
+
+function Invoke-HarnessCleanup {
+    $failures = New-Object Collections.ArrayList
+    $steps = @(
+        @{ stage = 'target-processes'; action = { if ('NativeInstallerProbe' -as [type]) { Stop-TargetProcesses } } },
+        @{ stage = 'suspended-processes'; action = { if ('NativeInstallerProbe' -as [type]) { foreach ($processId in @($SuspendedIds)) { [NativeInstallerProbe]::Resume($processId) | Out-Null } } } },
+        @{ stage = 'other-fixture'; action = { if ($null -ne $OtherProcess -and -not $OtherProcess.HasExited) { $OtherProcess.Kill(); Assert-True ($OtherProcess.WaitForExit(5000)) 'other-fixture-cleanup-timeout' } } },
+        @{ stage = 'installer-processes'; action = { Stop-OwnedInstallerProcesses $OwnedInstallerIds } },
+        @{ stage = 'installer-handles'; action = { foreach ($identity in $OwnedInstallerIdentities.Values) { if ($identity.ContainsKey('processHandle')) { $identity.processHandle.Dispose() } } } }
+    )
+    foreach ($step in $steps) {
+        try { & $step.action }
+        catch {
+            $failure = Get-SafeFailureEvidence $_
+            $failure.stage = $step.stage
+            $failures.Add($failure) | Out-Null
+        }
+    }
+    return @($failures)
+}
+
 function Invoke-Case([string]$Name, [scriptblock]$Body) {
     $case = [ordered]@{ name = $Name; status = 'running'; elapsedSeconds = 0; observations = $null }
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -145,6 +231,7 @@ function Invoke-Case([string]$Name, [scriptblock]$Body) {
         Write-Host ('FAIL ' + $Name + ' [' + $case.failureCode + ']')
     }
     finally {
+        if ($null -ne $LastFixtureCaseEvidence -and $LastFixtureCaseEvidence.caseName -ceq $Name) { $case.fixtureEvidence = $LastFixtureCaseEvidence }
         $case.elapsedSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 2)
         $Cases.Add([pscustomobject]$case) | Out-Null
     }
@@ -152,17 +239,23 @@ function Invoke-Case([string]$Name, [scriptblock]$Body) {
 }
 
 function Get-InstallerProcesses([System.Collections.Generic.HashSet[int]]$Ids) {
-    $all = @(Get-CimInstance Win32_Process)
+    $all = @(Get-CimInstance Win32_Process | Where-Object { $null -ne $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $LastInstallerInvocationStartedAt })
+    $snapshot = @{}
+    foreach ($item in $all) { $snapshot[[int]$item.ProcessId] = $item }
     for ($pass = 0; $pass -lt 4; $pass++) {
         foreach ($item in $all) {
             if ($Ids.Contains([int]$item.ParentProcessId) -and
                 -not [string]::Equals([string]$item.ExecutablePath, $TargetExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+                if (-not (Test-OwnedInstallerParent $item $snapshot)) { continue }
+                if ($Ids.Contains([int]$item.ProcessId) -and -not (Test-OwnedInstallerIdentity $item)) { continue }
+                if ($null -eq $item.CreationDate -or [string]::IsNullOrWhiteSpace([string]$item.ExecutablePath)) { continue }
+                $OwnedInstallerIdentities[[int]$item.ProcessId] = @{ startedAtFileTime = $item.CreationDate.ToUniversalTime().ToFileTimeUtc(); executablePath = [string]$item.ExecutablePath }
                 $Ids.Add([int]$item.ProcessId) | Out-Null
                 $OwnedInstallerIds.Add([int]$item.ProcessId) | Out-Null
             }
         }
     }
-    return @($all | Where-Object { $Ids.Contains([int]$_.ProcessId) })
+    return @($all | Where-Object { $Ids.Contains([int]$_.ProcessId) -and (Test-OwnedInstallerIdentity $_) })
 }
 
 function Read-PackagedHelperEvidence([object[]]$Processes, [object]$Package) {
@@ -278,10 +371,14 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
     if ($Mode -eq 'updated') { $arguments += '--updated --force-run ' }
     if ($Mode -eq 'silent') { $arguments += '/S ' }
     $arguments += '/D=' + $InstallDirectory
+    $script:LastInstallerInvocationStartedAt = [DateTime]::UtcNow
     $process = Start-Process -FilePath $Package.path -ArgumentList $arguments -PassThru
+    $null = $process.Handle
     $ids = New-Object 'System.Collections.Generic.HashSet[int]'
     $ids.Add($process.Id) | Out-Null
     $OwnedInstallerIds.Add($process.Id) | Out-Null
+    $OwnedInstallerIdentities[[int]$process.Id] = @{ startedAtFileTime = $process.StartTime.ToUniversalTime().ToFileTimeUtc(); executablePath = [string]$Package.path; processHandle = $process }
+    $script:LastInstallerInvocationIds = $ids
     $actions = New-Object System.Collections.ArrayList
     $trace = New-Object System.Collections.ArrayList
     $script:LastInstallerTrace = @()
@@ -395,7 +492,7 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario, [s
     }
     if ($lastUi.Count -gt 0) { $script:LastUiEvidence = Get-UiEvidence $lastUi }
     if ($timer.Elapsed.TotalSeconds -ge 240) {
-        foreach ($item in @(Get-InstallerProcesses $ids)) { Stop-Process -Id ([int]$item.ProcessId) -Force -ErrorAction SilentlyContinue }
+        Stop-OwnedInstallerProcesses $ids
         throw 'ASSERT:installer-timeout'
     }
     $process.Refresh()
@@ -607,11 +704,21 @@ function Get-CurrentUserInstallRegistration {
 }
 
 function Invoke-FixtureCase([string]$Mode, [string]$Scenario) {
-    Stop-TargetProcesses
-    Copy-Item -LiteralPath $FixtureExecutable -Destination $TargetExecutable -Force
-    $behavior = if ($Scenario -eq 'responsive') { 'normal' } elseif ($Scenario -eq 'delayed') { 'delayed' } else { 'hang' }
-    $script:FixtureProcess = Start-Process -FilePath $TargetExecutable -ArgumentList ($behavior + ' ' + $GracefulFixtureDelayMilliseconds) -PassThru
+    $bodyFailure = $null
+    $script:LastFixtureCaseEvidence = [ordered]@{
+        caseName = if ($Mode -eq 'silent') { 'silent-stuck-target-no-force-no-replacement' } else { $Mode + '-' + $Scenario }
+        bodyFailure = $null; cleanupFailure = $null; cleanupStage = 'not-started'; restoreVerified = $false
+        fixturePid = $null; fixtureEnumeratedByTargetQuery = $false; targetQueryPidsBeforeCleanup = @()
+        fixtureStillRunningAfterTargetStop = $false; expectedExeSha256 = $ExpectedInstalled.exe; observedExeSha256 = $null
+    }
+    $script:LastInstallerInvocationIds = $null
     try {
+        Stop-TargetProcesses
+        Copy-Item -LiteralPath $FixtureExecutable -Destination $TargetExecutable -Force
+        $behavior = if ($Scenario -eq 'responsive') { 'normal' } elseif ($Scenario -eq 'delayed') { 'delayed' } else { 'hang' }
+        $script:FixtureProcess = Start-Process -FilePath $TargetExecutable -ArgumentList ($behavior + ' ' + $GracefulFixtureDelayMilliseconds) -PassThru
+        $null = $FixtureProcess.Handle
+        $LastFixtureCaseEvidence.fixturePid = $FixtureProcess.Id
         Wait-VisibleWindow $FixtureProcess.Id 20 | Out-Null
         $before = Get-InstalledHashes
         $result = Invoke-Installer $Candidate $Mode $Scenario
@@ -637,10 +744,47 @@ function Invoke-FixtureCase([string]$Mode, [string]$Scenario) {
         $result.processEvidence = 'synthetic-window-process'
         return $result
     }
+    catch {
+        $bodyFailure = $_
+        $LastFixtureCaseEvidence.bodyFailure = Get-SafeFailureEvidence $_
+        throw
+    }
     finally {
-        Stop-TargetProcesses
-        Copy-Item -LiteralPath $BackupExecutable -Destination $TargetExecutable -Force
-        $script:FixtureProcess = $null
+        try {
+            $LastFixtureCaseEvidence.cleanupStage = 'settle-owned-installer'
+            if ($null -ne $bodyFailure -and $null -ne $LastInstallerInvocationIds) { Stop-OwnedInstallerProcesses $LastInstallerInvocationIds }
+            $LastFixtureCaseEvidence.cleanupStage = 'stop-targets'
+            $queried = @(Get-TargetProcesses)
+            $LastFixtureCaseEvidence.targetQueryPidsBeforeCleanup = @($queried | ForEach-Object { [int]$_.ProcessId })
+            if ($null -ne $FixtureProcess) { $LastFixtureCaseEvidence.fixtureEnumeratedByTargetQuery = @($queried | Where-Object { [int]$_.ProcessId -eq $FixtureProcess.Id }).Count -gt 0 }
+            Stop-TargetProcesses
+            $LastFixtureCaseEvidence.cleanupStage = 'settle-owned-fixture'
+            if ($null -ne $FixtureProcess) {
+                $FixtureProcess.Refresh()
+                $LastFixtureCaseEvidence.fixtureStillRunningAfterTargetStop = -not $FixtureProcess.HasExited
+                if (-not $FixtureProcess.HasExited) { $FixtureProcess.Kill() }
+                Assert-True ($FixtureProcess.WaitForExit(10000)) 'fixture-cleanup-exit-timeout'
+                $FixtureProcess.Refresh()
+                Assert-True $FixtureProcess.HasExited 'fixture-cleanup-process-survived'
+            }
+            Assert-True (@(Get-TargetProcesses).Count -eq 0) 'fixture-cleanup-target-process-remains'
+            $LastFixtureCaseEvidence.cleanupStage = 'copy-protected-exe'
+            Copy-Item -LiteralPath $BackupExecutable -Destination $TargetExecutable -Force
+            $LastFixtureCaseEvidence.cleanupStage = 'verify-protected-exe'
+            $LastFixtureCaseEvidence.observedExeSha256 = Get-Hash $TargetExecutable
+            Assert-True ($LastFixtureCaseEvidence.observedExeSha256 -eq $ExpectedInstalled.exe) 'fixture-protected-exe-not-restored'
+            $LastFixtureCaseEvidence.restoreVerified = $true
+            $LastFixtureCaseEvidence.cleanupStage = 'complete'
+        }
+        catch {
+            $script:FixtureRecoveryFailed = $true
+            $LastFixtureCaseEvidence.cleanupFailure = Get-SafeFailureEvidence $_
+            if ($null -eq $bodyFailure) { throw }
+        }
+        finally {
+            if ($null -ne $FixtureProcess) { $FixtureProcess.Dispose() }
+            $script:FixtureProcess = $null
+        }
     }
 }
 
@@ -1010,9 +1154,11 @@ public static class ValidationFixture {
     foreach ($mode in @('standalone', 'updated')) {
         foreach ($scenario in @('responsive', 'delayed', 'force-retry', 'cancel')) {
             Invoke-Case ($mode + '-' + $scenario) { Invoke-FixtureCase $mode $scenario } | Out-Null
+            Assert-True (-not $FixtureRecoveryFailed) 'fixture-recovery-failed-stopping-full-suite'
         }
     }
     Invoke-Case 'silent-stuck-target-no-force-no-replacement' { Invoke-FixtureCase 'silent' 'silent-block' } | Out-Null
+    Assert-True (-not $FixtureRecoveryFailed) 'fixture-recovery-failed-stopping-full-suite'
     Invoke-Case 'actual-protected-electron-visible-window-and-force-upgrade' {
         Stop-TargetProcesses
         $app = Start-Process -FilePath $TargetExecutable -PassThru
@@ -1100,18 +1246,17 @@ catch {
     Write-Host ('HARNESS FAILURE [' + $Failure + ']')
 }
 finally {
-    if ('NativeInstallerProbe' -as [type]) {
-        Stop-TargetProcesses
-        foreach ($id in @($SuspendedIds)) { [NativeInstallerProbe]::Resume($id) | Out-Null }
+    try { $Report.cleanupFailures = @(Invoke-HarnessCleanup) }
+    catch {
+        $Report.cleanupFailures = @((Get-SafeFailureEvidence $_))
+        $Report.cleanupFailures[0].stage = 'cleanup-boundary'
     }
-    if ($null -ne $OtherProcess -and -not $OtherProcess.HasExited) { Stop-Process -Id $OtherProcess.Id -Force -ErrorAction SilentlyContinue }
-    foreach ($id in @($OwnedInstallerIds)) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
     $Report.completedAt = [DateTime]::UtcNow.ToString('o')
     $Report.elapsedSeconds = [Math]::Round(([DateTime]::UtcNow - $StartedAt).TotalSeconds, 2)
     $Report.failureCode = $Failure
     $Report.failureLine = $FailureLine
     $Report.failedCaseCount = @($Cases | Where-Object { $_.status -eq 'failed' }).Count
-    $Report.status = if ($null -eq $Failure -and $Report.failedCaseCount -eq 0 -and $Cases.Count -eq $ExpectedCaseCount) { 'passed' } else { 'failed' }
+    $Report.status = if ($null -eq $Failure -and $Report.failedCaseCount -eq 0 -and $Cases.Count -eq $ExpectedCaseCount -and $Report.cleanupFailures.Count -eq 0) { 'passed' } else { 'failed' }
     if (Get-Variable LastUiEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastUi = $script:LastUiEvidence }
     if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstallerTrace = $script:LastInstallerTrace }
     if (Get-Variable LastInstalledVersionEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstalledVersion = $script:LastInstalledVersionEvidence }
