@@ -1,105 +1,78 @@
-name: Diagnose native Windows installer crash
+name: Verify official electron-builder installer
 
 on:
   workflow_dispatch:
-    inputs:
-      modes:
-        description: JSON array of isolated diagnostic modes
-        type: string
-        default: '["direct","original-name","current-user","all-users","compat-invoker","debugger"]'
-      installerRelease:
-        description: Release tag containing the installer to test
-        type: string
-        default: candidate
-      installerAsset:
-        description: Setup asset name in the selected release
-        type: string
-        default: candidate-setup.exe
-      installerSha256:
-        description: Expected SHA256 of the selected Setup
-        type: string
-        default: 3a6860d8d546055393c451f487f6240c5570f982b5038370978efc82cda8d091
 
 permissions:
   contents: read
 
 jobs:
-  diagnose:
+  lifecycle:
     strategy:
       fail-fast: false
       matrix:
-        mode: ${{ fromJSON(inputs.modes) }}
+        mode: [direct, current-user, all-users]
     runs-on: windows-2025
-    timeout-minutes: 12
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-      - name: Match the reproduced runner environment
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          npm install --global --no-audit --no-fund '@openai/codex@0.162.0'
-          if ($LASTEXITCODE -ne 0) { throw 'Tool environment setup failed' }
-          npm install --no-audit --no-fund --no-save --package-lock=false 'playwright@1.59.1'
-          if ($LASTEXITCODE -ne 0) { throw 'Tool environment setup failed' }
-      - name: Fetch exact reproduced candidate
-        timeout-minutes: 5
+      - name: Fetch hash-pinned protected candidate
+        timeout-minutes: 2
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          INSTALLER_RELEASE: ${{ inputs.installerRelease }}
-          INSTALLER_ASSET: ${{ inputs.installerAsset }}
-          INSTALLER_SHA256: ${{ inputs.installerSha256 }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          gh release download $env:INSTALLER_RELEASE --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern $env:INSTALLER_ASSET --dir payload
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
-          $installerPath = (Resolve-Path -LiteralPath (Join-Path 'payload' $env:INSTALLER_ASSET)).Path
-          if ((Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:INSTALLER_SHA256.ToLowerInvariant()) { throw 'Candidate hash mismatch' }
-          "INSTALLER_PATH=$installerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Install Microsoft native debugging tools
-        if: matrix.mode == 'debugger' || matrix.mode == 'wer'
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $debuggerPath = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Debuggers/x86/cdb.exe'
-          if (-not (Test-Path -LiteralPath $debuggerPath)) {
-            $sdkPath = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
-            Invoke-WebRequest -Uri 'https://download.microsoft.com/download/f4b30f2a-4fc3-430e-9b03-c842b5f5f9f1/KIT_BUNDLE_WINDOWSSDK_MEDIACREATION/winsdksetup.exe' -OutFile $sdkPath
-            if ((Get-FileHash -LiteralPath $sdkPath -Algorithm SHA256).Hash -ne '6FA0FA27DB77A909F5ECB35183CB26A969A6775936780936FE239E4F9C66B458') { throw 'Microsoft SDK installer hash mismatch' }
-            $signature = Get-AuthenticodeSignature -LiteralPath $sdkPath
-            if ($signature.Status -ne 'Valid') { throw 'Microsoft SDK installer signature invalid' }
-            $sdkProcess = Start-Process -FilePath $sdkPath -ArgumentList '/features OptionId.WindowsDesktopDebuggers /quiet /norestart /ceip off' -PassThru
-            if (-not $sdkProcess.WaitForExit(240000)) { $sdkProcess.Kill(); throw 'Debugger feature install timed out' }
-            if ($sdkProcess.ExitCode -notin @(0, 3010)) { throw "Debugger feature install failed ($($sdkProcess.ExitCode))" }
-          }
-          if (-not (Test-Path -LiteralPath $debuggerPath)) { throw '32-bit CDB was not installed' }
-          "DEBUGGER_PATH=$debuggerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Run one isolated diagnostic probe
+          gh release download builder-26.15.3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern official-setup.exe --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
+      - name: Install, verify payload and shortcuts, reinstall and uninstall
         timeout-minutes: 5
         shell: pwsh
         env:
-          DIAGNOSTIC_MODE: ${{ matrix.mode }}
+          PROBE_MODE: ${{ matrix.mode }}
         run: |
-          $parameters = @{ Mode = $env:DIAGNOSTIC_MODE; InstallerPath = $env:INSTALLER_PATH; OutputDirectory = './diagnostics' }
-          if ($env:DEBUGGER_PATH) { $parameters.DebuggerPath = $env:DEBUGGER_PATH }
-          if ($env:DIAGNOSTIC_MODE -eq 'wer') {
-            $parameters.Remove('Mode')
-            & ./scripts/capture-installer-crash.ps1 @parameters
-          } else {
-            & ./scripts/debug-installer.ps1 @parameters
-          }
-      - name: Upload diagnostic evidence without dumps
+          & ./scripts/verify-lifecycle.ps1 -Mode $env:PROBE_MODE
+          if (-not $?) { throw 'native-lifecycle-failed' }
+      - name: Upload sanitized lifecycle evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: diagnose-${{ matrix.mode }}
-          path: diagnostics/
-          if-no-files-found: warn
+          name: official-lifecycle-${{ matrix.mode }}
+          path: lifecycle-evidence/
           retention-days: 7
+          if-no-files-found: error
+
+  interactive:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Fetch authorized candidate and baseline
+        timeout-minutes: 3
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download builder-26.15.3 --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern official-setup.exe --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'candidate-download-failed' }
+          gh release download candidate --repo 98624017/aiwork-installer-ps51-20261020-xksqya --pattern baseline-setup.exe --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'baseline-download-failed' }
+      - name: Verify interactive install and upgrade with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          & ./scripts/verify-windows-installer.ps1 -ManifestPath ./official-candidate.json -PayloadDirectory ./payload -OutputDirectory ./interactive-evidence
+      - name: Upload sanitized interactive evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: official-interactive-${{ matrix.os }}
+          path: interactive-evidence/
+          retention-days: 7
+          if-no-files-found: error
