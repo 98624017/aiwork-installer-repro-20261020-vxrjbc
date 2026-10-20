@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "scenario": "original",
+  "startedAt": "2026-10-20T02:33:30.7396400Z",
+  "verdict": "timeout",
+  "environment": {
+    "powershell": "7.6.6",
+    "edition": "Core",
+    "image": "win25-vs2026",
+    "imageVersion": "20261007.264.1",
+    "sessionId": 2,
+    "os": "Microsoft Windows NT 10.0.26100.0"
+  },
+  "installDirectory": "D:\\a\\_temp\\AIwork 中文 空格",
+  "requestedInstallDirectory": "D:\\a\\_temp\\AIwork 中文 空格",
+  "installer": {
+    "path": "D:\\a\\aiwork-installer-repro-20261020-vxrjbc\\aiwork-installer-repro-20261020-vxrjbc\\payload\\candidate-setup.exe",
+    "exists": true,
+    "sha256": "3a6860d8d546055393c451f487f6240c5570f982b5038370978efc82cda8d091",
+    "expectedSha256": "",
+    "expectedMatches": null
+  },
+  "invocation": {
+    "executable": "D:\\a\\_temp\\installer-input-original\\setup.exe",
+    "argumentList": "/S /D=D:\\a\\_temp\\AIwork 中文 空格",
+    "copiedBytesMatch": true
+  },
+  "wer": {
+    "configured": true,
+    "existingKey": false,
+    "dumpsUploaded": false,
+    "dumps": []
+  },
+  "elapsedSeconds": 240.36,
+  "timedOut": true,
+  "parent": {
+    "pid": 6068,
+    "exited": true,
+    "exitCode": -1073741819
+  },
+  "ui": [],
+  "processes": [
+    {
+      "elapsedSeconds": 0,
+      "pid": 6068,
+      "parentPid": 4208,
+      "name": "setup.exe",
+      "commandLine": "setup.exe /S /D=D:\\a\\_temp\\AIwork 中文 空格"
+    },
+    {
+      "elapsedSeconds": 1.99,
+      "pid": 5384,
+      "parentPid": 6068,
+      "name": "setup.exe",
+      "commandLine": "\"D:\\a\\_temp\\installer-input-original\\setup.exe\" /S /D=D:\\a\\_temp\\AIwork 中文 空格"
+    },
+    {
+      "elapsedSeconds": 1.99,
+      "pid": 4308,
+      "parentPid": 6068,
+      "name": "WerFault.exe",
+      "commandLine": "[descendant arguments omitted]"
+    }
+  ],
+  "processExits": [
+    {
+      "pid": 6068,
+      "exited": true,
+      "exitCode": -1073741819
+    },
+    {
+      "pid": 4308,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 5384,
+      "exited": false,
+      "exitCode": null
+    }
+  ],
+  "installationPathAmbiguous": false,
+  "discoveredExecutables": [],
+  "files": {
+    "exe": {
+      "path": "D:\\a\\_temp\\AIwork 中文 空格\\ai-canvas.exe",
+      "exists": false,
+      "sha256": null,
+      "expectedSha256": "0609c9bb440496e4e2c0bc697e6be06e1f9a2f70814949b50b67740860fb5cbf",
+      "expectedMatches": false
+    },
+    "asar": {
+      "path": "D:\\a\\_temp\\AIwork 中文 空格\\resources\\app.asar",
+      "exists": false,
+      "sha256": null,
+      "expectedSha256": "73cbb1448374aa8b3ed473fc328816c07318229703134efda38bd0b65e3151ff",
+      "expectedMatches": false
+    }
+  },
+  "uninstallers": [],
+  "agentCliFiles": [],
+  "shortcuts": [],
+  "uninstallEntries": [],
+  "crashEvents": [],
+  "installationComplete": false,
+  "observedAccessViolation": true,
+  "warnings": []
+}

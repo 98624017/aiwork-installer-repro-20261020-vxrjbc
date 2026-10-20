@@ -1,0 +1,363 @@
+{
+  "schemaVersion": 1,
+  "scenario": "original",
+  "startedAt": "2026-10-20T02:33:24.9236787Z",
+  "verdict": "installed",
+  "environment": {
+    "powershell": "7.6.6",
+    "edition": "Core",
+    "image": "win22",
+    "imageVersion": "20261012.333.1",
+    "sessionId": 2,
+    "os": "Microsoft Windows NT 10.0.20348.0"
+  },
+  "installDirectory": "D:\\a\\_temp\\AIwork 中文 空格",
+  "requestedInstallDirectory": "D:\\a\\_temp\\AIwork 中文 空格",
+  "installer": {
+    "path": "D:\\a\\aiwork-installer-repro-20261020-vxrjbc\\aiwork-installer-repro-20261020-vxrjbc\\payload\\candidate-setup.exe",
+    "exists": true,
+    "sha256": "3a6860d8d546055393c451f487f6240c5570f982b5038370978efc82cda8d091",
+    "expectedSha256": "",
+    "expectedMatches": null
+  },
+  "invocation": {
+    "executable": "D:\\a\\_temp\\installer-input-original\\setup.exe",
+    "argumentList": "/S /D=D:\\a\\_temp\\AIwork 中文 空格",
+    "copiedBytesMatch": true
+  },
+  "wer": {
+    "configured": true,
+    "existingKey": false,
+    "dumpsUploaded": false,
+    "dumps": []
+  },
+  "elapsedSeconds": 33.82,
+  "timedOut": false,
+  "parent": {
+    "pid": 2164,
+    "exited": true,
+    "exitCode": 0
+  },
+  "ui": [],
+  "processes": [
+    {
+      "elapsedSeconds": 0,
+      "pid": 2164,
+      "parentPid": 6272,
+      "name": "setup.exe",
+      "commandLine": "setup.exe /S /D=D:\\a\\_temp\\AIwork 中文 空格"
+    },
+    {
+      "elapsedSeconds": 1.96,
+      "pid": 1420,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 1.97,
+      "pid": 1220,
+      "parentPid": 1420,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 7.7,
+      "pid": 1856,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 7.7,
+      "pid": 1760,
+      "parentPid": 1856,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 15.37,
+      "pid": 2028,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 15.37,
+      "pid": 3060,
+      "parentPid": 2028,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 18.06,
+      "pid": 7044,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 18.06,
+      "pid": 4864,
+      "parentPid": 7044,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 19.11,
+      "pid": 6016,
+      "parentPid": 7044,
+      "name": "csc.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 20.16,
+      "pid": 6820,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 20.16,
+      "pid": 7320,
+      "parentPid": 6820,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 20.7,
+      "pid": 6960,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 20.7,
+      "pid": 5976,
+      "parentPid": 6960,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 21.26,
+      "pid": 5328,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 21.26,
+      "pid": 5156,
+      "parentPid": 5328,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 21.79,
+      "pid": 436,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 21.79,
+      "pid": 7608,
+      "parentPid": 436,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 22.33,
+      "pid": 2620,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 22.33,
+      "pid": 6056,
+      "parentPid": 2620,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 22.85,
+      "pid": 2516,
+      "parentPid": 2164,
+      "name": "powershell.exe",
+      "commandLine": "[descendant arguments omitted]"
+    },
+    {
+      "elapsedSeconds": 22.85,
+      "pid": 7700,
+      "parentPid": 2516,
+      "name": "conhost.exe",
+      "commandLine": "[descendant arguments omitted]"
+    }
+  ],
+  "processExits": [
+    {
+      "pid": 1220,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 2620,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 7700,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 7320,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 2028,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 436,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 7044,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 3060,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 6056,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 7608,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 6016,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 1760,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 5976,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 2164,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 4864,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 1420,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 5156,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 6820,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 1856,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 2516,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 6960,
+      "exited": true,
+      "exitCode": 0
+    },
+    {
+      "pid": 5328,
+      "exited": true,
+      "exitCode": 0
+    }
+  ],
+  "installationPathAmbiguous": false,
+  "discoveredExecutables": [
+    "D:\\a\\_temp\\AIwork 中文 空格\\ai-canvas.exe"
+  ],
+  "files": {
+    "exe": {
+      "path": "D:\\a\\_temp\\AIwork 中文 空格\\ai-canvas.exe",
+      "exists": true,
+      "sha256": "0609c9bb440496e4e2c0bc697e6be06e1f9a2f70814949b50b67740860fb5cbf",
+      "expectedSha256": "0609c9bb440496e4e2c0bc697e6be06e1f9a2f70814949b50b67740860fb5cbf",
+      "expectedMatches": true
+    },
+    "asar": {
+      "path": "D:\\a\\_temp\\AIwork 中文 空格\\resources\\app.asar",
+      "exists": true,
+      "sha256": "73cbb1448374aa8b3ed473fc328816c07318229703134efda38bd0b65e3151ff",
+      "expectedSha256": "73cbb1448374aa8b3ed473fc328816c07318229703134efda38bd0b65e3151ff",
+      "expectedMatches": true
+    }
+  },
+  "uninstallers": [
+    {
+      "path": "D:\\a\\_temp\\AIwork 中文 空格\\Uninstall ai-canvas.exe",
+      "exists": true,
+      "sha256": "a6710f2d4bd1d2d89612ae82d3c2c76523b075077b636e84678ddab8ffc79f6a",
+      "expectedSha256": "",
+      "expectedMatches": null
+    }
+  ],
+  "agentCliFiles": [
+    {
+      "path": "D:\\a\\_temp\\AIwork 中文 空格\\resources\\agent-cli\\canvasai.exe",
+      "exists": true,
+      "sha256": "70305062ade8c05d9617e5907d53a01efb08e4180fbeadc6cff180d5202c24a0",
+      "expectedSha256": "",
+      "expectedMatches": null
+    }
+  ],
+  "shortcuts": [],
+  "uninstallEntries": [
+    {
+      "key": "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\3b731237-98e1-50c0-957c-cc53cb848251",
+      "DisplayName": "AI 创作工作台",
+      "DisplayVersion": "0.7.0",
+      "UninstallString": "\"D:\\a\\_temp\\AIwork 中文 空格\\Uninstall ai-canvas.exe\" /currentuser",
+      "QuietUninstallString": "\"D:\\a\\_temp\\AIwork 中文 空格\\Uninstall ai-canvas.exe\" /currentuser /S",
+      "Publisher": "example.com"
+    }
+  ],
+  "crashEvents": [],
+  "installationComplete": true,
+  "observedAccessViolation": false,
+  "warnings": []
+}
